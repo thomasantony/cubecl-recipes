@@ -1,0 +1,10 @@
+[package]
+name = "cubecl-recipes"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cubecl = { version = "0.8.1", features = ["wgpu"] }
+
+[dev-dependencies]
+cubecl = { version = "0.8.1", features = ["wgpu"] }
