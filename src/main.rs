@@ -76,13 +76,23 @@ fn kernel_block_exclusive_sum(input_data: &Array<u32>, output_data: &mut Array<u
     output_data[block_id * CUBE_DIM + thread_id] = result;
 }
 
-#[cube(launch)]
-fn kernel_double_numbers(input_data: &Array<u32>, scale: u32, output_data: &mut Array<u32>) {
+#[cube]
+fn do_scale(input: &Array<u32>, scale: u32) -> u32 {
     let block_id = CUBE_POS;
     let thread_id = UNIT_POS;
 
     let index = block_id * CUBE_DIM + thread_id;
-    output_data[index] = input_data[index] * scale;
+    input[index] * scale
+}
+
+#[cube(launch)]
+fn kernel_scale_numbers(input_data: &Array<u32>, scale: u32, output_data: &mut Array<u32>) {
+    let block_id = CUBE_POS;
+    let thread_id = UNIT_POS;
+    let mynumber = 0;
+
+    let index = block_id * CUBE_DIM + thread_id;
+    output_data[index] = do_scale(input_data, scale);
 }
 
 fn launch_double_numbers_kernel<R: Runtime>(
@@ -93,7 +103,7 @@ fn launch_double_numbers_kernel<R: Runtime>(
     num_elements: usize,
 ) {
     unsafe {
-        kernel_double_numbers::launch::<R>(
+        kernel_scale_numbers::launch::<R>(
             &client,
             CubeCount::Static(1, 1, 1),
             CubeDim::new(num_elements as u32, 1, 1),
