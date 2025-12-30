@@ -8,3 +8,23 @@ cubecl = { version = "0.8.1", features = ["wgpu"] }
 
 [dev-dependencies]
 cubecl = { version = "0.8.1", features = ["wgpu"] }
+
+[[bin]]
+name = "00_double_numbers"
+path = "src/bin/00_double_numbers/main.rs"
+
+[[bin]]
+name = "01_scale_numbers"
+path = "src/bin/01_scale_numbers/main.rs"
+
+[[bin]]
+name = "02_plane_sum"
+path = "src/bin/02_plane_sum/main.rs"
+
+[[bin]]
+name = "03_plane_broadcast"
+path = "src/bin/03_plane_broadcast/main.rs"
+
+[[bin]]
+name = "04_block_sum"
+path = "src/bin/04_block_sum/main.rs"
