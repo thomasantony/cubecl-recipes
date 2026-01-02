@@ -10,8 +10,11 @@
 use cubecl::prelude::*;
 
 #[cube(launch)]
-fn kernel_block_exclusive_sum(input_data: &Array<u32>, output_data: &mut Array<u32>) {
-    let num_planes: u32 = CUBE_DIM / PLANE_DIM;
+fn kernel_block_exclusive_sum(
+    input_data: &Array<u32>,
+    output_data: &mut Array<u32>,
+    #[comptime] num_planes: u32,
+) {
     let block_id = CUBE_POS;
     let thread_id = UNIT_POS;
     let plane_thread_idx = UNIT_POS_PLANE;
@@ -25,7 +28,8 @@ fn kernel_block_exclusive_sum(input_data: &Array<u32>, output_data: &mut Array<u
     };
 
     // Define shared memory for inter-plane communication
-    let mut shared_totals = SharedMemory::<u32>::new(2);
+    // Size is determined at kernel compile time via comptime parameter
+    let mut shared_totals = SharedMemory::<u32>::new(num_planes);
 
     // 1. Local scan within plane
     let original = input_data[thread_idx];
@@ -68,6 +72,7 @@ fn main() {
     let output_data_gpu = client.create(u32::as_bytes(&zeros));
 
     const BLOCK_SIZE: usize = 64;
+    const NUM_PLANES: u32 = (BLOCK_SIZE / PLANE_DIM as usize) as u32;
     let num_blocks = num_elements / BLOCK_SIZE;
 
     unsafe {
@@ -77,12 +82,16 @@ fn main() {
             CubeDim::new(BLOCK_SIZE as u32, 1, 1),
             ArrayArg::from_raw_parts::<u32>(&input_data_gpu, num_elements, 1),
             ArrayArg::from_raw_parts::<u32>(&output_data_gpu, num_elements, 1),
+            NUM_PLANES,
         )
     }
 
     let result = client.read_one(output_data_gpu.clone());
     let output = u32::from_bytes(&result).to_vec();
     println!("Block Exclusive Sum: {:?}", output);
-    println!("\nNote: This computes prefix sum across the entire block of {} elements", BLOCK_SIZE);
+    println!(
+        "\nNote: This computes prefix sum across the entire block of {} elements",
+        BLOCK_SIZE
+    );
     println!("For input of all 1s, output is [0, 1, 2, 3, ..., 63]");
 }
