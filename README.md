@@ -25,6 +25,7 @@ cargo run --bin 00_double_numbers
 | [02_plane_sum](src/bin/02_plane_sum/) | Plane-level exclusive prefix sum using `plane_exclusive_sum` |
 | [03_plane_broadcast](src/bin/03_plane_broadcast/) | Broadcasting values across threads with `plane_broadcast` |
 | [04_block_sum](src/bin/04_block_sum/) | Block-level prefix sum using shared memory |
+| [05_hierarchical_scan](src/bin/05_hierarchical_scan/) | Hierarchical prefix sum for arbitrarily large arrays |
 
 ## Resources
 
