@@ -17,13 +17,13 @@ A "plane" in CubeCL corresponds to a "warp" (NVIDIA) or "wavefront" (AMD). It's 
 ```rust
 #[cube(launch)]
 fn kernel_plane_exclusive_sum(input_data: &Array<u32>, output_data: &mut Array<u32>) {
-    let block_id = CUBE_POS;
-    let thread_id = UNIT_POS;
+    // ABSOLUTE_POS is equivalent to CUBE_POS * CUBE_DIM + UNIT_POS
+    let index = ABSOLUTE_POS;
 
-    let local_data = input_data[block_id * CUBE_DIM + thread_id];
+    let local_data = input_data[index];
     let local_sum = plane_exclusive_sum(local_data);
 
-    output_data[block_id * CUBE_DIM + thread_id] = local_sum;
+    output_data[index] = local_sum;
 }
 ```
 

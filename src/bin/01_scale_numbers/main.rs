@@ -9,19 +9,15 @@ use cubecl::server::Handle;
 
 #[cube]
 fn do_scale(input: &Array<u32>, scale: u32) -> u32 {
-    let block_id = CUBE_POS;
-    let thread_id = UNIT_POS;
-
-    let index = block_id * CUBE_DIM + thread_id;
+    // ABSOLUTE_POS is equivalent to CUBE_POS * CUBE_DIM + UNIT_POS
+    let index = ABSOLUTE_POS;
     input[index] * scale
 }
 
 #[cube(launch)]
 fn kernel_scale_numbers(input_data: &Array<u32>, scale: u32, output_data: &mut Array<u32>) {
-    let block_id = CUBE_POS;
-    let thread_id = UNIT_POS;
-
-    let index = block_id * CUBE_DIM + thread_id;
+    // ABSOLUTE_POS is equivalent to CUBE_POS * CUBE_DIM + UNIT_POS
+    let index = ABSOLUTE_POS;
     output_data[index] = do_scale(input_data, scale);
 }
 

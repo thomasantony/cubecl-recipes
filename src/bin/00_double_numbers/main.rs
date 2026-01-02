@@ -7,10 +7,8 @@ use cubecl::prelude::*;
 
 #[cube(launch)]
 fn kernel_double_numbers(input_data: &Array<u32>, output_data: &mut Array<u32>) {
-    let block_id = CUBE_POS;
-    let thread_id = UNIT_POS;
-
-    let index = block_id * CUBE_DIM + thread_id;
+    // ABSOLUTE_POS is equivalent to CUBE_POS * CUBE_DIM + UNIT_POS
+    let index = ABSOLUTE_POS;
     output_data[index] = input_data[index] * 2;
 }
 

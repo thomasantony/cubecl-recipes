@@ -9,16 +9,16 @@ use cubecl::prelude::*;
 
 #[cube(launch)]
 fn kernel_plane_broadcast(input_data: &Array<u32>, output_data: &mut Array<u32>) {
-    let block_id = CUBE_POS;
-    let thread_id = UNIT_POS;
+    // ABSOLUTE_POS is equivalent to CUBE_POS * CUBE_DIM + UNIT_POS
+    let index = ABSOLUTE_POS;
 
-    let local_data = input_data[block_id * CUBE_DIM + thread_id];
+    let local_data = input_data[index];
 
     // Get the value of local_data from thread #7 (zero-indexed) in the plane
     let value_from_thread_7 = plane_broadcast(local_data, 7);
 
     // Add it to the current value
-    output_data[block_id * CUBE_DIM + thread_id] = local_data + value_from_thread_7;
+    output_data[index] = local_data + value_from_thread_7;
 }
 
 fn main() {

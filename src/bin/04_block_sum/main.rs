@@ -15,12 +15,12 @@ fn kernel_block_exclusive_sum(
     output_data: &mut Array<u32>,
     #[comptime] num_planes: u32,
 ) {
-    let block_id = CUBE_POS;
     let thread_id = UNIT_POS;
     let plane_thread_idx = UNIT_POS_PLANE;
     let plane_idx = thread_id / PLANE_DIM;
 
-    let thread_idx = block_id * CUBE_DIM + thread_id;
+    // ABSOLUTE_POS is equivalent to CUBE_POS * CUBE_DIM + UNIT_POS
+    let thread_idx = ABSOLUTE_POS;
     let plane_size = if CUBE_DIM < PLANE_DIM {
         CUBE_DIM
     } else {
@@ -53,7 +53,7 @@ fn kernel_block_exclusive_sum(
     // 4. Apply offset from previous planes
     let result = local_scan + shared_totals[plane_idx];
 
-    output_data[block_id * CUBE_DIM + thread_id] = result;
+    output_data[thread_idx] = result;
 }
 
 fn main() {
