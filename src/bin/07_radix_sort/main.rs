@@ -12,7 +12,6 @@ const HISTOGRAM_BLOCK_SIZE: usize = 256;
 // const PREFIX_BLOCK_SIZE: usize = HISTOGRAM_SIZE / 2;
 const PREFIX_BLOCK_SIZE: usize = HISTOGRAM_SIZE;
 const SCATTER_BLOCK_SIZE: usize = 256;
-
 const SCATTER_BLOCK_KVS: usize = SCATTER_BLOCK_SIZE * TILE_SIZE;
 
 const HISTOGRAM_BLOCK_SIZE_U32: u32 = HISTOGRAM_BLOCK_SIZE as u32;
@@ -23,6 +22,29 @@ use cubecl::server::Handle;
 #[cube]
 fn extract_digit(pass: u32, value: u32) -> u32 {
     (value >> (pass * BITS_PER_PASS)) & ((1u32 << BITS_PER_PASS) - 1u32)
+}
+
+// Copy keys from global memory to local memory (use coalesced access for tiles)
+#[cube]
+fn fill_kv(input_data: &Array<u32>, kv: &mut Array<u32>, num_elements: u32) {
+    let tile_start_idx: u32 = CUBE_POS * HISTOGRAM_BLOCK_SIZE_U32 * TILE_SIZE_U32;
+
+    // Each thread will process TILE_SIZE elements
+    for i in 0u32..comptime!(TILE_SIZE as u32) {
+        // Stride to allow memory coalescing
+        //
+        // [ x x x ....  x     | y y  .........  ]
+        //   ^th0        ^th255  ^th0
+        //     ^th1                ^th1
+        //  <---- tile 0 -----> <--- tile 1 ---->
+        //
+        let idx = tile_start_idx + i * TILE_SIZE_U32 + UNIT_POS;
+        if idx < num_elements {
+            kv[i] = input_data[idx];
+        } else {
+            kv[i] = 0xFFFFFFFFu32;
+        }
+    }
 }
 
 #[cube]
@@ -64,25 +86,7 @@ fn kernel_calc_histogram(
     // Allocate registers/local memory for the current "tile" of keys
     let mut kv = Array::<u32>::new(comptime!(TILE_SIZE as u32));
 
-    // fill_kv()
-    let tile_start_idx: u32 = (CUBE_POS * HISTOGRAM_BLOCK_SIZE_U32 * TILE_SIZE_U32);
-
-    // Each thread will process TILE_SIZE elements
-    for i in 0u32..comptime!(TILE_SIZE as u32) {
-        // Stride to allow memory coalescing
-        //
-        // [ x x x ....  x     | y y  .........  ]
-        //   ^th0        ^th255  ^th0
-        //     ^th1                ^th1
-        //  <---- tile 0 -----> <--- tile 1 ---->
-        //
-        let idx = tile_start_idx + i * TILE_SIZE_U32 + UNIT_POS;
-        if idx < num_elements {
-            kv[i] = input_data[idx];
-        } else {
-            kv[i] = 0xFFFFFFFFu32;
-        }
-    }
+    fill_kv(input_data, &mut kv, num_elements);
 
     let smem: SharedMemory<Atomic<u32>> = SharedMemory::<Atomic<u32>>::new(HISTOGRAM_SIZE_U32);
 
