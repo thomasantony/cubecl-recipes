@@ -25,10 +25,10 @@ fn extract_digit(pass: u32, value: u32) -> u32 {
 }
 
 #[derive(CubeType, CubeLaunch)]
-struct ParitionMaskInfo {
-    mask_invalid: u32,
-    mask_reduction: u32,
-    mask_prefix: u32,
+struct PartitionMaskInfo {
+    pub mask_invalid: u32,
+    pub mask_reduction: u32,
+    pub mask_prefix: u32,
 }
 
 // Copy keys from global memory to local memory (use coalesced access for tiles)
@@ -248,7 +248,7 @@ fn decoupled_lookback(
     smem: &SharedMemory<Atomic<u32>>,          // local histogram from Step 3
     scatter_smem: &mut SharedMemory<u32>,      // to cache global prefix
     pass: u32,
-    partition_mask_info: &ParitionMaskInfo,
+    partition_mask_info: &PartitionMaskInfo,
 ) {
     // Partition status lives after the global histograms
     let partition_offset = UNIT_POS;
@@ -331,7 +331,7 @@ fn decoupled_lookback(
 }
 
 #[cube]
-fn local_prefix_sum(smem: &mut SharedMemory<u32>, #[comptime] num_planes: u32) {
+fn local_prefix_sum(smem: &SharedMemory<Atomic<u32>>, #[comptime] num_planes: u32) {
     let lid = UNIT_POS;
     let plane_idx = lid / PLANE_DIM;
 
@@ -339,7 +339,7 @@ fn local_prefix_sum(smem: &mut SharedMemory<u32>, #[comptime] num_planes: u32) {
     let mut shared_totals = SharedMemory::<u32>::new(num_planes);
 
     // 1. Local scan within plane
-    let original = smem[lid];
+    let original = Atomic::load(&smem[lid]);
     let local_scan = plane_exclusive_sum(original);
 
     // 2. Plane totals -> shared memory
@@ -360,7 +360,7 @@ fn local_prefix_sum(smem: &mut SharedMemory<u32>, #[comptime] num_planes: u32) {
 
     // 4. Apply offset from previous planes
     let result = local_scan + shared_totals[plane_idx];
-    smem[lid] = result;
+    Atomic::store(&smem[lid], result);
 
     sync_cube();
 }
@@ -369,12 +369,12 @@ fn local_prefix_sum(smem: &mut SharedMemory<u32>, #[comptime] num_planes: u32) {
 fn rank_to_local_index(
     kv: &Array<u32>,
     kr: &mut Array<u32>,
-    smem: &SharedMemory<u32>, // now contains local prefix sums
+    smem: &SharedMemory<Atomic<u32>>, // now contains local prefix sums
     pass: u32,
 ) {
     for j in 0..TILE_SIZE_U32 {
         let digit = extract_digit(kv[j], pass);
-        let local_prefix = smem[digit]; // where this digit starts in tile
+        let local_prefix = Atomic::load(&smem[digit]); // where this digit starts in tile
         let rank = kr[j]; // block-global rank (1-indexed)
 
         let local_idx = local_prefix + rank; // position within tile (1-indexed)
@@ -473,7 +473,7 @@ fn kernel_scatter(
     keys_out: &mut Array<u32>,
     histograms: &Array<Atomic<u32>>,
     partition_status: &mut Array<Atomic<u32>>,
-    partition_mask_info: &ParitionMaskInfo,
+    partition_mask_info: &PartitionMaskInfo,
     #[comptime] pass: u32,
     #[comptime] num_elements: u32,
     #[comptime] num_planes: u32,
@@ -491,17 +491,27 @@ fn kernel_scatter(
     compute_local_count_and_rank(&kv, &mut kr, pass);
 
     // Shared memory for block-level histogram
-    let smem: SharedMemory<Atomic<u32>> = SharedMemory::<Atomic<u32>>::new(HISTOGRAM_SIZE_U32);
+
+    // Histogram: atomic during accumulation, becomes local prefix after step 5
+    let mut histogram_smem = SharedMemory::<Atomic<u32>>::new(HISTOGRAM_SIZE_U32);
+
+    // Global prefixes from look-back (step 4), read in step 8
+    let mut global_prefix_smem = SharedMemory::<u32>::new(HISTOGRAM_SIZE_U32);
+
+    // Reorder buffer (step 7 only) - could alias histogram_smem if you're clever
+    let mut reorder_smem = SharedMemory::<u32>::new(TILE_SIZE_U32);
+
+    let mut reorder_smem = SharedMemory::<u32>::new(TILE_SIZE_U32);
+
     // Step 3: Accumulate local histogram
-    accumulate_local_histogram(&kv, &mut kr, &smem, pass);
+    accumulate_local_histogram(&kv, &mut kr, &histogram_smem, pass);
 
     // Step 4. Decoupled Lookback
-    let mut scatter_smem: SharedMemory<u32> = SharedMemory::<u32>::new(HISTOGRAM_SIZE_U32);
     decoupled_lookback(
         histograms,
         partition_status,
-        &smem,
-        &mut scatter_smem,
+        &histogram_smem,
+        &mut global_prefix_smem,
         pass,
         partition_mask_info,
     );
@@ -509,17 +519,17 @@ fn kernel_scatter(
     // Step 5: Prefix scan of local histogram in shared memory
     // Restrict to first HISTOGRAM_SIZE_U32 threads
     if UNIT_POS < HISTOGRAM_SIZE_U32 {
-        local_prefix_sum(&mut scatter_smem, num_planes);
+        local_prefix_sum(&histogram_smem, num_planes);
     }
     sync_cube();
 
     // Step 6:
-    rank_to_local_index(&kv, &mut kr, &scatter_smem, pass);
+    rank_to_local_index(&kv, &mut kr, &histogram_smem, pass);
 
     // Step 7
-    reorder_in_shared_memory(&mut kv, &mut kr, &mut scatter_smem);
+    reorder_in_shared_memory(&mut kv, &mut kr, &mut reorder_smem);
 
-    local_to_global_index(&kv, &mut kr, &scatter_smem, pass);
+    local_to_global_index(&kv, &mut kr, &global_prefix_smem, pass);
 
     store_to_global(&kv, &kr, keys_out);
 }
@@ -564,6 +574,9 @@ fn main() {
             num_planes,
         );
     }
+
+    // let odd_partition_status = PartitionMaskInfo {};
+
     let result = client.read_one(histo_buffer.clone());
     let output = u32::from_bytes(&result).to_vec();
 
