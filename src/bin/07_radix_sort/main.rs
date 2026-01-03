@@ -31,6 +31,27 @@ struct PartitionMaskInfo {
     pub mask_prefix: u32,
 }
 
+// Status bits occupy top 2 bits (30-31)
+// Even pass: after writing, bits are 0b00, 0b01, or 0b10
+// Odd pass:  after writing, bits are 0b10, 0b11, or 0b00
+// This way odd pass sees even's PREFIX (0b10) as INVALID, no zeroing needed
+
+fn even_partition_mask_info<'a, R: Runtime>() -> PartitionMaskInfoLaunch<'a, R> {
+    PartitionMaskInfoLaunch::<R>::new(
+        ScalarArg::new(0b00 << 30), // mask_invalid = 0x00000000
+        ScalarArg::new(0b01 << 30), // mask_reduction = 0x40000000
+        ScalarArg::new(0b10 << 30), // mask_prefix = 0x80000000
+    )
+}
+
+fn odd_partition_mask_info<'a, R: Runtime>() -> PartitionMaskInfoLaunch<'a, R> {
+    PartitionMaskInfoLaunch::<R>::new(
+        ScalarArg::new(0b01 << 30), // mask_invalid = 0x40000000
+        ScalarArg::new(0b11 << 30), // mask_reduction = 0xC0000000
+        ScalarArg::new(0b00 << 30), // mask_prefix = 0x00000000
+    )
+}
+
 // Copy keys from global memory to local memory (use coalesced access for tiles)
 #[cube]
 fn fill_kv(input_data: &Array<u32>, kv: &mut Array<u32>, num_elements: u32) {
@@ -212,7 +233,6 @@ fn accumulate_local_histogram(
     let num_planes = CUBE_DIM / PLANE_DIM;
 
     // Sequential - each "plane" waits for the previous one to finish (hence the sync_cube())
-    #[unroll]
     for i in 0..num_planes {
         if plane_id == i {
             for j in 0..TILE_SIZE_U32 {
@@ -493,14 +513,12 @@ fn kernel_scatter(
     // Shared memory for block-level histogram
 
     // Histogram: atomic during accumulation, becomes local prefix after step 5
-    let mut histogram_smem = SharedMemory::<Atomic<u32>>::new(HISTOGRAM_SIZE_U32);
+    let histogram_smem = SharedMemory::<Atomic<u32>>::new(HISTOGRAM_SIZE_U32);
 
     // Global prefixes from look-back (step 4), read in step 8
     let mut global_prefix_smem = SharedMemory::<u32>::new(HISTOGRAM_SIZE_U32);
 
     // Reorder buffer (step 7 only) - could alias histogram_smem if you're clever
-    let mut reorder_smem = SharedMemory::<u32>::new(TILE_SIZE_U32);
-
     let mut reorder_smem = SharedMemory::<u32>::new(TILE_SIZE_U32);
 
     // Step 3: Accumulate local histogram
@@ -549,9 +567,6 @@ fn main() {
     let histo_buffer = client.empty(NUM_DIGITS * HISTOGRAM_SIZE * ELEM_SIZE);
 
     let num_blocks = num_elements.div_ceil(HISTOGRAM_BLOCK_SIZE);
-    let partition_buffer = client.empty(num_blocks * HISTOGRAM_SIZE * ELEM_SIZE);
-
-    println!("num_blocks = {}", num_blocks);
 
     unsafe {
         kernel_calc_histogram::launch::<R>(
@@ -574,10 +589,26 @@ fn main() {
             num_planes,
         );
     }
+    println!("Calling scatter kernel");
 
-    // let odd_partition_status = PartitionMaskInfo {};
+    let partition_buffer = client.empty(num_blocks * HISTOGRAM_SIZE * ELEM_SIZE);
+    unsafe {
+        kernel_scatter::launch::<R>(
+            &client,
+            CubeCount::Static(num_blocks as u32, 1, 1),
+            CubeDim::new(SCATTER_BLOCK_SIZE as u32, 1, 1),
+            ArrayArg::from_raw_parts::<u32>(&input_data_gpu, num_elements, 1),
+            ArrayArg::from_raw_parts::<u32>(&output_data_gpu, num_elements, 1),
+            ArrayArg::from_raw_parts::<u32>(&histo_buffer, NUM_DIGITS * HISTOGRAM_SIZE, 1),
+            ArrayArg::from_raw_parts::<u32>(&partition_buffer, num_blocks * HISTOGRAM_SIZE, 1),
+            even_partition_mask_info::<R>(),
+            0u32,
+            num_elements as u32,
+            num_planes,
+        );
+    }
 
-    let result = client.read_one(histo_buffer.clone());
+    let result = client.read_one(output_data_gpu.clone());
     let output = u32::from_bytes(&result).to_vec();
 
     println!("Histo for pass 0: {:?}", &output[..256]);
