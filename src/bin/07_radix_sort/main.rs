@@ -163,20 +163,19 @@ fn kernel_scatter(
 ) {
     // Allocate registers/local memory for the current "tile" of keys
     let mut kv = Array::<u32>::new(comptime!(TILE_SIZE_U32));
+
+    // kr will hold (count | rank) for current tile's digits
     let mut kr = Array::<u32>::new(comptime!(TILE_SIZE_U32));
 
-    // Shared memory for block-level histogram
-    let smem: SharedMemory<Atomic<u32>> = SharedMemory::<Atomic<u32>>::new(HISTOGRAM_SIZE_U32);
-
-    let lane_mask_lt = (1u32 << UNIT_POS_PLANE) - 1;
+    let lane_mask_lt = Line::new((1u32 << UNIT_POS_PLANE) - 1u32);
 
     fill_kv(keys_in, &mut kv, num_elements);
     for j in 0..TILE_SIZE_U32 {
         let digit = extract_digit(pass, kv[j]);
 
         // Build match_mask: bit j is set iff lane j has same digit as me
-        let mut match_mask: u32 = 0xFFFFFFFFu32;
 
+        let mut match_mask = Line::<u32>::new(0xFFFFFFFFu32);
         // Unrolled for 8-bit digit
         #[unroll]
         for bit in 0u32..8u32 {
@@ -184,21 +183,28 @@ fn kernel_scatter(
             let predicate = my_bit == 1u32;
             let ballot = plane_ballot(predicate);
 
-            let mask_for_bit = ballot[0] ^ (0u32 - (1u32 - my_bit));
+            let mask_for_bit = Line::new(ballot[0] ^ (0u32 - (1u32 - my_bit)));
             match_mask = match_mask & mask_for_bit;
         }
 
         // count = total lanes with same digit
-        let count = popcount(match_mask);
+        let count = match_mask.count_ones()[0];
 
         // rank = how many matching lanes have lower lane_id than me, plus 1
         // (1-indexed to match the WGSL implementation)
         match_mask = match_mask & lane_mask_lt;
-
-        let rank = popcount(match_mask) + 1u32;
+        let rank = match_mask.count_ones()[0] + 1;
 
         kr[j] = (count << 16) | rank;
     }
+
+    // Shared memory for block-level histogram
+    let smem: SharedMemory<Atomic<u32>> = SharedMemory::<Atomic<u32>>::new(HISTOGRAM_SIZE_U32);
+
+    if UNIT_POS < HISTOGRAM_SIZE_U32 {
+        Atomic::store(&smem[UNIT_POS], 0u32);
+    }
+    sync_cube();
 }
 
 fn main() {
