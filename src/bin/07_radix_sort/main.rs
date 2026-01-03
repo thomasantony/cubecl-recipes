@@ -24,6 +24,13 @@ fn extract_digit(pass: u32, value: u32) -> u32 {
     (value >> (pass * BITS_PER_PASS)) & ((1u32 << BITS_PER_PASS) - 1u32)
 }
 
+#[derive(CubeType)]
+struct ParitionMaskInfo {
+    mask_invalid: u32, // changes per odd/even
+    mask_reduction: u32,
+    mask_prefix: u32,
+}
+
 // Copy keys from global memory to local memory (use coalesced access for tiles)
 #[cube]
 fn fill_kv(input_data: &Array<u32>, kv: &mut Array<u32>, num_elements: u32) {
@@ -154,118 +161,10 @@ fn popcount(x: u32) -> u32 {
     v & 0x3Fu32
 }
 
-const RADIX_SIZE: u32 = 256;
-const NUM_PASSES: u32 = 4; // for 32-bit keys
-
 #[cube]
-fn decoupled_lookback(
-    histograms: &mut Array<Atomic<u32>>,  // global histogram buffer
-    smem: &SharedMemory<Atomic<u32>>,     // local histogram from Step 3
-    scatter_smem: &mut SharedMemory<u32>, // to cache global prefix
-    pass: u32,
-    partition_mask_invalid: u32, // changes per odd/even
-    partition_mask_reduction: u32,
-    partition_mask_prefix: u32,
-    #[comptime] radix_size: u32,
-) {
-    let lid = UNIT_POS;
-    let wid = CUBE_POS;
-
-    // Partition status lives after the global histograms
-    let partitions_base = NUM_PASSES * radix_size;
-    let partition_offset = partitions_base + lid;
-    let partition_base = wid * radix_size;
-
-    if wid == 0 {
-        // First workgroup: read directly from pre-computed global prefix
-        if lid < radix_size {
-            let hist_offset = pass * radix_size + lid;
-            let exc = Atomic::load(&histograms[hist_offset]);
-            let red = Atomic::load(&smem[lid]);
-
-            // Cache global prefix for Step 8
-            scatter_smem[lid] = exc;
-
-            // Publish inclusive prefix (exc + red) with PREFIX status
-            let inc = exc + red;
-            Atomic::store(&histograms[partition_offset], inc | partition_mask_prefix);
-        }
-    } else {
-        // Non-first workgroups
-
-        // Publish local reduction first (so later workgroups can see us)
-        if lid < radix_size {
-            let red = Atomic::load(&smem[lid]);
-            Atomic::store(
-                &histograms[partition_offset + partition_base],
-                red | partition_mask_reduction,
-            );
-        }
-
-        // Look back to compute exclusive prefix
-        if lid < radix_size {
-            let mut exc: u32 = 0;
-            let mut partition_base_prev = partition_base - radix_size;
-            let mut done = false;
-
-            // Spin until we find a PREFIX
-            while !done {
-                let prev = Atomic::load(&histograms[partition_base_prev + partition_offset]);
-                let status = prev & STATUS_MASK;
-
-                if status != partition_mask_invalid {
-                    // Valid entry - accumulate count
-                    exc += prev & COUNT_MASK;
-
-                    if status == partition_mask_prefix {
-                        // Found a prefix - we're done
-                        done = true;
-                    } else {
-                        // It's a reduction - keep looking back
-                        partition_base_prev -= radix_size;
-                    }
-                }
-                // If INVALID, just loop again (spin-wait)
-            }
-
-            // Cache global prefix for Step 8
-            scatter_smem[lid] = exc;
-
-            // Upgrade our REDUCTION to PREFIX
-            // Adding (exc | 0x40000000) flips REDUCTION (0b01) to PREFIX (0b10)
-            // because 0b01 + 0b01 = 0b10
-            Atomic::add(
-                &histograms[partition_offset + partition_base],
-                exc | (1u32 << 30),
-            );
-        }
-    }
-
-    sync_cube();
-
-    // After this:
-    // - scatter_smem[digit] = global exclusive prefix for this workgroup
-    // - smem[digit] = local histogram (unchanged, needed for Step 5)
-}
-
-#[cube(launch)]
-fn kernel_scatter(
-    keys_in: &Array<u32>,
-    keys_out: &mut Array<u32>,
-    histograms: &Array<u32>,
-    #[comptime] num_elements: u32,
-    #[comptime] pass: u32,
-) {
-    // Allocate registers/local memory for the current "tile" of keys
-    let mut kv = Array::<u32>::new(comptime!(TILE_SIZE_U32));
-
-    // kr will hold (count | rank) for current tile's digits
-    let mut kr = Array::<u32>::new(comptime!(TILE_SIZE_U32));
-
+fn compute_local_count_and_rank(kv: &Array<u32>, kr: &mut Array<u32>, pass: u32) {
     let lane_mask_lt = Line::new((1u32 << UNIT_POS_PLANE) - 1u32);
 
-    // Compute local count + rank for each item in tile and store in kr
-    fill_kv(keys_in, &mut kv, num_elements);
     for j in 0..TILE_SIZE_U32 {
         let digit = extract_digit(pass, kv[j]);
 
@@ -293,10 +192,15 @@ fn kernel_scatter(
 
         kr[j] = (count << 16) | rank;
     }
+}
 
-    // Shared memory for block-level histogram
-    let smem: SharedMemory<Atomic<u32>> = SharedMemory::<Atomic<u32>>::new(HISTOGRAM_SIZE_U32);
-
+#[cube]
+fn accumulate_local_histogram(
+    kv: &Array<u32>,
+    kr: &mut Array<u32>,
+    smem: &SharedMemory<Atomic<u32>>,
+    pass: u32,
+) {
     // First zero it out
     if UNIT_POS < HISTOGRAM_SIZE_U32 {
         Atomic::store(&smem[UNIT_POS], 0u32);
@@ -335,6 +239,121 @@ fn kernel_scatter(
     // Now:
     // - smem[digit] contains local histogram (total count per digit in this tile)
     // - kr[j] contains workgroup-global rank (1-indexed) for each key
+}
+
+const RADIX_SIZE: u32 = 256;
+const NUM_PASSES: u32 = 4; // for 32-bit keys
+
+#[cube]
+fn decoupled_lookback(
+    histograms: &mut Array<Atomic<u32>>, // global histogram buffer
+    partition_status: &mut Array<Atomic<u32>>, // storage for partition information
+    smem: &SharedMemory<Atomic<u32>>,    // local histogram from Step 3
+    scatter_smem: &mut SharedMemory<u32>, // to cache global prefix
+    pass: u32,
+    partition_mask_info: &ParitionMaskInfo,
+) {
+    // Partition status lives after the global histograms
+    let partition_offset = UNIT_POS;
+    let partition_base = CUBE_POS * HISTOGRAM_SIZE_U32;
+
+    if CUBE_POS == 0 {
+        // First workgroup: read directly from pre-computed global prefix
+        if UNIT_POS < HISTOGRAM_SIZE_U32 {
+            let hist_offset = pass * HISTOGRAM_SIZE_U32 + UNIT_POS;
+            let exc = Atomic::load(&histograms[hist_offset]);
+            let red = Atomic::load(&smem[UNIT_POS]);
+
+            // Cache global prefix for Step 8
+            scatter_smem[UNIT_POS] = exc;
+
+            // Publish inclusive prefix (exc + red) with PREFIX status
+            let inc = exc + red;
+            Atomic::store(
+                &partition_status[partition_offset],
+                inc | partition_mask_info.mask_prefix,
+            );
+        }
+    } else {
+        // Non-first workgroups
+
+        // Publish local reduction first (so later workgroups can see us)
+        if UNIT_POS < HISTOGRAM_SIZE_U32 {
+            let red = Atomic::load(&smem[UNIT_POS]);
+            Atomic::store(
+                &partition_status[partition_base],
+                red | partition_mask_info.mask_reduction,
+            );
+        }
+
+        // Look back to compute exclusive prefix
+        if UNIT_POS < HISTOGRAM_SIZE_U32 {
+            let mut exc: u32 = 0;
+            let mut partition_base_prev = partition_base - HISTOGRAM_SIZE_U32;
+            let mut done = false;
+
+            // Spin until we find a PREFIX
+            while !done {
+                let prev = Atomic::load(&partition_status[partition_base_prev + partition_offset]);
+                let status = prev & STATUS_MASK;
+
+                if status != partition_mask_info.mask_invalid {
+                    // VaUNIT_POS entry - accumulate count
+                    exc += prev & COUNT_MASK;
+
+                    if status == partition_mask_info.mask_prefix {
+                        // Found a prefix - we're done
+                        done = true;
+                    } else {
+                        // It's a reduction - keep looking back
+                        partition_base_prev -= HISTOGRAM_SIZE_U32;
+                    }
+                }
+                // If INVALID, just loop again (spin-wait)
+            }
+
+            // Cache global prefix for Step 8
+            scatter_smem[UNIT_POS] = exc;
+
+            // Upgrade our REDUCTION to PREFIX
+            // Adding (exc | 0x40000000) flips REDUCTION (0b01) to PREFIX (0b10)
+            // because 0b01 + 0b01 = 0b10
+            Atomic::add(
+                &partition_status[partition_offset + partition_base],
+                exc | (1u32 << 30),
+            );
+        }
+    }
+
+    sync_cube();
+
+    // After this:
+    // - scatter_smem[digit] = global exclusive prefix for this workgroup
+    // - smem[digit] = local histogram (unchanged, needed for Step 5)
+}
+
+#[cube(launch)]
+fn kernel_scatter(
+    keys_in: &Array<u32>,
+    keys_out: &mut Array<u32>,
+    histograms: &Array<u32>,
+    partition_mask_info: &ParitionMaskInfo,
+    #[comptime] num_elements: u32,
+    #[comptime] pass: u32,
+) {
+    // Allocate registers/local memory for the current "tile" of keys
+    let mut kv = Array::<u32>::new(comptime!(TILE_SIZE_U32));
+
+    // kr will hold (count | rank) for current tile's digits
+    let mut kr = Array::<u32>::new(comptime!(TILE_SIZE_U32));
+
+    // Compute local count + rank for each item in tile and store in kr
+    fill_kv(keys_in, &mut kv, num_elements);
+    compute_local_count_and_rank(&kv, &mut kr, pass);
+
+    // Shared memory for block-level histogram
+    let smem: SharedMemory<Atomic<u32>> = SharedMemory::<Atomic<u32>>::new(HISTOGRAM_SIZE_U32);
+    accumulate_local_histogram(&kv, &mut kr, &smem, pass);
 
     // Step 4. Decoupled Lookback
 }
