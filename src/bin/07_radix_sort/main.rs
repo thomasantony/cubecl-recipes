@@ -139,6 +139,68 @@ fn kernel_prefix_histogram(histograms: &mut Array<u32>, #[comptime] num_planes: 
     prefix_histogram_pass(3u32, histograms, num_planes);
 }
 
+const RS_PARTITION_MASK_STATUS: u32 = 0xC0000000u32; // top 2 bits
+const RS_PARTITION_MASK_COUNT: u32 = 0x3FFFFFFFu32; // bottom 30 bits
+
+#[cube]
+fn popcount(x: u32) -> u32 {
+    let mut v = x;
+    v = v - ((v >> 1u32) & 0x55555555u32);
+    v = (v & 0x33333333u32) + ((v >> 2u32) & 0x33333333u32);
+    v = (v + (v >> 4u32)) & 0x0F0F0F0Fu32;
+    v = v + (v >> 8u32);
+    v = v + (v >> 16u32);
+    v & 0x3Fu32
+}
+
+#[cube(launch)]
+fn kernel_scatter(
+    keys_in: &Array<u32>,
+    keys_out: &mut Array<u32>,
+    histograms: &Array<u32>,
+    #[comptime] num_elements: u32,
+    #[comptime] pass: u32,
+) {
+    // Allocate registers/local memory for the current "tile" of keys
+    let mut kv = Array::<u32>::new(comptime!(TILE_SIZE_U32));
+    let mut kr = Array::<u32>::new(comptime!(TILE_SIZE_U32));
+
+    // Shared memory for block-level histogram
+    let smem: SharedMemory<Atomic<u32>> = SharedMemory::<Atomic<u32>>::new(HISTOGRAM_SIZE_U32);
+
+    let lane_mask_lt = (1u32 << UNIT_POS_PLANE) - 1;
+
+    fill_kv(keys_in, &mut kv, num_elements);
+    for j in 0..TILE_SIZE_U32 {
+        let digit = extract_digit(pass, kv[j]);
+
+        // Build match_mask: bit j is set iff lane j has same digit as me
+        let mut match_mask: u32 = 0xFFFFFFFFu32;
+
+        // Unrolled for 8-bit digit
+        #[unroll]
+        for bit in 0u32..8u32 {
+            let my_bit = (digit >> bit) & 1u32;
+            let predicate = my_bit == 1u32;
+            let ballot = plane_ballot(predicate);
+
+            let mask_for_bit = ballot[0] ^ (0u32 - (1u32 - my_bit));
+            match_mask = match_mask & mask_for_bit;
+        }
+
+        // count = total lanes with same digit
+        let count = popcount(match_mask);
+
+        // rank = how many matching lanes have lower lane_id than me, plus 1
+        // (1-indexed to match the WGSL implementation)
+        match_mask = match_mask & lane_mask_lt;
+
+        let rank = popcount(match_mask) + 1u32;
+
+        kr[j] = (count << 16) | rank;
+    }
+}
+
 fn main() {
     let device = Default::default();
     let client = cubecl::wgpu::WgpuRuntime::client(&device);
@@ -150,6 +212,7 @@ fn main() {
 
     const ELEM_SIZE: usize = std::mem::size_of::<u32>();
     let input_data_gpu = client.create(u32::as_bytes(&input_data));
+    let output_data_gpu = client.empty(num_elements * ELEM_SIZE);
     let histo_buffer = client.empty(NUM_DIGITS * HISTOGRAM_SIZE * ELEM_SIZE);
 
     let num_blocks = num_elements.div_ceil(HISTOGRAM_BLOCK_SIZE);
