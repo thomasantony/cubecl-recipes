@@ -24,9 +24,9 @@ fn extract_digit(pass: u32, value: u32) -> u32 {
     (value >> (pass * BITS_PER_PASS)) & ((1u32 << BITS_PER_PASS) - 1u32)
 }
 
-#[derive(CubeType)]
+#[derive(CubeType, CubeLaunch)]
 struct ParitionMaskInfo {
-    mask_invalid: u32, // changes per odd/even
+    mask_invalid: u32,
     mask_reduction: u32,
     mask_prefix: u32,
 }
@@ -246,10 +246,10 @@ const NUM_PASSES: u32 = 4; // for 32-bit keys
 
 #[cube]
 fn decoupled_lookback(
-    histograms: &mut Array<Atomic<u32>>, // global histogram buffer
+    histograms: &Array<Atomic<u32>>,           // global histogram buffer
     partition_status: &mut Array<Atomic<u32>>, // storage for partition information
-    smem: &SharedMemory<Atomic<u32>>,    // local histogram from Step 3
-    scatter_smem: &mut SharedMemory<u32>, // to cache global prefix
+    smem: &SharedMemory<Atomic<u32>>,          // local histogram from Step 3
+    scatter_smem: &mut SharedMemory<u32>,      // to cache global prefix
     pass: u32,
     partition_mask_info: &ParitionMaskInfo,
 ) {
@@ -258,37 +258,37 @@ fn decoupled_lookback(
     let partition_base = CUBE_POS * HISTOGRAM_SIZE_U32;
 
     if CUBE_POS == 0 {
-        // First workgroup: read directly from pre-computed global prefix
+        // First block: read directly from pre-computed global prefix
         if UNIT_POS < HISTOGRAM_SIZE_U32 {
             let hist_offset = pass * HISTOGRAM_SIZE_U32 + UNIT_POS;
-            let exc = Atomic::load(&histograms[hist_offset]);
-            let red = Atomic::load(&smem[UNIT_POS]);
+            let global_prefix = Atomic::load(&histograms[hist_offset]);
+            let local_prefix = Atomic::load(&smem[UNIT_POS]);
 
             // Cache global prefix for Step 8
-            scatter_smem[UNIT_POS] = exc;
+            scatter_smem[UNIT_POS] = global_prefix;
 
-            // Publish inclusive prefix (exc + red) with PREFIX status
-            let inc = exc + red;
+            // Publish inclusive prefix with PREFIX status
+            let inc = global_prefix + local_prefix;
             Atomic::store(
                 &partition_status[partition_offset],
                 inc | partition_mask_info.mask_prefix,
             );
         }
     } else {
-        // Non-first workgroups
+        // All the later blocks
 
         // Publish local reduction first (so later workgroups can see us)
         if UNIT_POS < HISTOGRAM_SIZE_U32 {
-            let red = Atomic::load(&smem[UNIT_POS]);
+            let local_reduction = Atomic::load(&smem[UNIT_POS]);
             Atomic::store(
                 &partition_status[partition_base],
-                red | partition_mask_info.mask_reduction,
+                local_reduction | partition_mask_info.mask_reduction,
             );
         }
 
         // Look back to compute exclusive prefix
         if UNIT_POS < HISTOGRAM_SIZE_U32 {
-            let mut exc: u32 = 0;
+            let mut global_prefix: u32 = 0;
             let mut partition_base_prev = partition_base - HISTOGRAM_SIZE_U32;
             let mut done = false;
 
@@ -298,8 +298,8 @@ fn decoupled_lookback(
                 let status = prev & STATUS_MASK;
 
                 if status != partition_mask_info.mask_invalid {
-                    // VaUNIT_POS entry - accumulate count
-                    exc += prev & COUNT_MASK;
+                    // Valid entry - accumulate count
+                    global_prefix += prev & COUNT_MASK;
 
                     if status == partition_mask_info.mask_prefix {
                         // Found a prefix - we're done
@@ -313,14 +313,15 @@ fn decoupled_lookback(
             }
 
             // Cache global prefix for Step 8
-            scatter_smem[UNIT_POS] = exc;
+            scatter_smem[UNIT_POS] = global_prefix;
 
             // Upgrade our REDUCTION to PREFIX
             // Adding (exc | 0x40000000) flips REDUCTION (0b01) to PREFIX (0b10)
             // because 0b01 + 0b01 = 0b10
+
             Atomic::add(
                 &partition_status[partition_offset + partition_base],
-                exc | (1u32 << 30),
+                global_prefix | (1u32 << 30),
             );
         }
     }
@@ -336,7 +337,8 @@ fn decoupled_lookback(
 fn kernel_scatter(
     keys_in: &Array<u32>,
     keys_out: &mut Array<u32>,
-    histograms: &Array<u32>,
+    histograms: &Array<Atomic<u32>>,
+    partition_status: &mut Array<Atomic<u32>>,
     partition_mask_info: &ParitionMaskInfo,
     #[comptime] num_elements: u32,
     #[comptime] pass: u32,
@@ -356,6 +358,15 @@ fn kernel_scatter(
     accumulate_local_histogram(&kv, &mut kr, &smem, pass);
 
     // Step 4. Decoupled Lookback
+    let mut scatter_smem: SharedMemory<u32> = SharedMemory::<u32>::new(HISTOGRAM_SIZE_U32);
+    decoupled_lookback(
+        histograms,
+        partition_status,
+        &smem,
+        &mut scatter_smem,
+        pass,
+        partition_mask_info,
+    );
 }
 
 fn main() {
@@ -373,6 +384,7 @@ fn main() {
     let histo_buffer = client.empty(NUM_DIGITS * HISTOGRAM_SIZE * ELEM_SIZE);
 
     let num_blocks = num_elements.div_ceil(HISTOGRAM_BLOCK_SIZE);
+    let partition_buffer = client.empty(num_blocks * HISTOGRAM_SIZE * ELEM_SIZE);
 
     println!("num_blocks = {}", num_blocks);
 
