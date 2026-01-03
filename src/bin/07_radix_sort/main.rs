@@ -331,7 +331,7 @@ fn decoupled_lookback(
 }
 
 #[cube]
-fn local_prefix_sum(smem: &SharedMemory<Atomic<u32>>, #[comptime] num_planes: u32) {
+fn local_prefix_sum(smem: &mut SharedMemory<u32>, #[comptime] num_planes: u32) {
     let lid = UNIT_POS;
     let plane_idx = lid / PLANE_DIM;
 
@@ -339,7 +339,7 @@ fn local_prefix_sum(smem: &SharedMemory<Atomic<u32>>, #[comptime] num_planes: u3
     let mut shared_totals = SharedMemory::<u32>::new(num_planes);
 
     // 1. Local scan within plane
-    let original = Atomic::load(&smem[lid]);
+    let original = smem[lid];
     let local_scan = plane_exclusive_sum(original);
 
     // 2. Plane totals -> shared memory
@@ -360,9 +360,111 @@ fn local_prefix_sum(smem: &SharedMemory<Atomic<u32>>, #[comptime] num_planes: u3
 
     // 4. Apply offset from previous planes
     let result = local_scan + shared_totals[plane_idx];
-    Atomic::store(&smem[lid], result);
+    smem[lid] = result;
 
     sync_cube();
+}
+
+#[cube]
+fn rank_to_local_index(
+    kv: &Array<u32>,
+    kr: &mut Array<u32>,
+    smem: &SharedMemory<u32>, // now contains local prefix sums
+    pass: u32,
+) {
+    for j in 0..TILE_SIZE_U32 {
+        let digit = extract_digit(kv[j], pass);
+        let local_prefix = smem[digit]; // where this digit starts in tile
+        let rank = kr[j]; // block-global rank (1-indexed)
+
+        let local_idx = local_prefix + rank; // position within tile (1-indexed)
+
+        kr[j] = rank | (local_idx << 16); // pack both
+    }
+}
+
+/// Step 7: Reorder keys within tile using shared memory
+///
+/// Before: kv[j] = keys in original load order
+///         kr[j] = (local_idx << 16) | rank
+/// After:  kv[j] = keys in digit-sorted order within tile
+///         kr[j] = rank only (lower 16 bits)
+#[cube]
+fn reorder_in_shared_memory(
+    kv: &mut Array<u32>,
+    kr: &mut Array<u32>,
+    reorder_smem: &mut SharedMemory<u32>, // size = tile_size
+) {
+    let lid = UNIT_POS_X;
+
+    // --- Scatter keys to sorted positions ---
+    #[unroll]
+    for j in 0..TILE_SIZE_U32 {
+        let local_idx = kr[j] >> 16; // destination (1-indexed)
+        reorder_smem[local_idx - 1] = kv[j]; // -1 for 0-indexed
+    }
+
+    sync_cube();
+
+    // --- Gather keys back in linear order ---
+    #[unroll]
+    for j in 0..TILE_SIZE_U32 {
+        let smem_idx = lid + j * CUBE_DIM;
+        kv[j] = reorder_smem[smem_idx];
+    }
+
+    sync_cube();
+
+    // --- Scatter kr to sorted positions in reorder_smem (need rank for Step 8) ---
+    #[unroll]
+    for j in 0..TILE_SIZE_U32 {
+        let local_idx = kr[j] >> 16;
+        reorder_smem[local_idx - 1] = kr[j] & 0xFFFF; // store just rank
+    }
+
+    sync_cube();
+
+    // --- Gather kr back in linear order ---
+    #[unroll]
+    for j in 0..TILE_SIZE_U32 {
+        let smem_idx = lid + j * CUBE_DIM;
+        kr[j] = reorder_smem[smem_idx];
+    }
+
+    sync_cube();
+}
+
+/// Step 8: Convert local rank to global output index
+///
+/// Before: kv[j] = keys in digit-sorted order within tile
+///         kr[j] = rank within digit group (1-indexed)
+///         scatter_smem[digit] = global exclusive prefix for this workgroup
+/// After:  kr[j] = final global output index
+#[cube]
+fn local_to_global_index(
+    kv: &Array<u32>,
+    kr: &mut Array<u32>,
+    scatter_smem: &SharedMemory<u32>, // global prefixes from Step 4
+    pass: u32,
+) {
+    #[unroll]
+    for j in 0..TILE_SIZE_U32 {
+        let digit = extract_digit(kv[j], pass);
+        let global_prefix = scatter_smem[digit];
+        let rank = kr[j]; // 1-indexed
+
+        kr[j] = global_prefix + rank - 1; // 0-indexed global position
+    }
+}
+
+/// Step 9: Store keys to global memory
+#[cube]
+fn store_to_global(kv: &Array<u32>, kr: &Array<u32>, keys_out: &mut Array<u32>) {
+    #[unroll]
+    for j in 0..TILE_SIZE_U32 {
+        let global_idx = kr[j];
+        keys_out[global_idx] = kv[j];
+    }
 }
 
 #[cube(launch)]
@@ -405,11 +507,21 @@ fn kernel_scatter(
     );
 
     // Step 5: Prefix scan of local histogram in shared memory
-    // restrict to first HISTOGRAM_SIZE_U32 threads
+    // Restrict to first HISTOGRAM_SIZE_U32 threads
     if UNIT_POS < HISTOGRAM_SIZE_U32 {
-        local_prefix_sum(&smem, num_planes);
+        local_prefix_sum(&mut scatter_smem, num_planes);
     }
     sync_cube();
+
+    // Step 6:
+    rank_to_local_index(&kv, &mut kr, &scatter_smem, pass);
+
+    // Step 7
+    reorder_in_shared_memory(&mut kv, &mut kr, &mut scatter_smem);
+
+    local_to_global_index(&kv, &mut kr, &scatter_smem, pass);
+
+    store_to_global(&kv, &kr, keys_out);
 }
 
 fn main() {
