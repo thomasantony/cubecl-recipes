@@ -139,8 +139,9 @@ fn kernel_prefix_histogram(histograms: &mut Array<u32>, #[comptime] num_planes: 
     prefix_histogram_pass(3u32, histograms, num_planes);
 }
 
-const RS_PARTITION_MASK_STATUS: u32 = 0xC0000000u32; // top 2 bits
-const RS_PARTITION_MASK_COUNT: u32 = 0x3FFFFFFFu32; // bottom 30 bits
+const STATUS_MASK: u32 = 0xC0000000u32; // top 2 bits
+const COUNT_MASK: u32 = 0x3FFFFFFFu32; // bottom 30 bits
+const STATUS_BITS: u32 = 30;
 
 #[cube]
 fn popcount(x: u32) -> u32 {
@@ -151,6 +152,100 @@ fn popcount(x: u32) -> u32 {
     v = v + (v >> 8u32);
     v = v + (v >> 16u32);
     v & 0x3Fu32
+}
+
+const RADIX_SIZE: u32 = 256;
+const NUM_PASSES: u32 = 4; // for 32-bit keys
+
+#[cube]
+fn decoupled_lookback(
+    histograms: &mut Array<Atomic<u32>>,  // global histogram buffer
+    smem: &SharedMemory<Atomic<u32>>,     // local histogram from Step 3
+    scatter_smem: &mut SharedMemory<u32>, // to cache global prefix
+    pass: u32,
+    partition_mask_invalid: u32, // changes per odd/even
+    partition_mask_reduction: u32,
+    partition_mask_prefix: u32,
+    #[comptime] radix_size: u32,
+) {
+    let lid = UNIT_POS;
+    let wid = CUBE_POS;
+
+    // Partition status lives after the global histograms
+    let partitions_base = NUM_PASSES * radix_size;
+    let partition_offset = partitions_base + lid;
+    let partition_base = wid * radix_size;
+
+    if wid == 0 {
+        // First workgroup: read directly from pre-computed global prefix
+        if lid < radix_size {
+            let hist_offset = pass * radix_size + lid;
+            let exc = Atomic::load(&histograms[hist_offset]);
+            let red = Atomic::load(&smem[lid]);
+
+            // Cache global prefix for Step 8
+            scatter_smem[lid] = exc;
+
+            // Publish inclusive prefix (exc + red) with PREFIX status
+            let inc = exc + red;
+            Atomic::store(&histograms[partition_offset], inc | partition_mask_prefix);
+        }
+    } else {
+        // Non-first workgroups
+
+        // Publish local reduction first (so later workgroups can see us)
+        if lid < radix_size {
+            let red = Atomic::load(&smem[lid]);
+            Atomic::store(
+                &histograms[partition_offset + partition_base],
+                red | partition_mask_reduction,
+            );
+        }
+
+        // Look back to compute exclusive prefix
+        if lid < radix_size {
+            let mut exc: u32 = 0;
+            let mut partition_base_prev = partition_base - radix_size;
+            let mut done = false;
+
+            // Spin until we find a PREFIX
+            while !done {
+                let prev = Atomic::load(&histograms[partition_base_prev + partition_offset]);
+                let status = prev & STATUS_MASK;
+
+                if status != partition_mask_invalid {
+                    // Valid entry - accumulate count
+                    exc += prev & COUNT_MASK;
+
+                    if status == partition_mask_prefix {
+                        // Found a prefix - we're done
+                        done = true;
+                    } else {
+                        // It's a reduction - keep looking back
+                        partition_base_prev -= radix_size;
+                    }
+                }
+                // If INVALID, just loop again (spin-wait)
+            }
+
+            // Cache global prefix for Step 8
+            scatter_smem[lid] = exc;
+
+            // Upgrade our REDUCTION to PREFIX
+            // Adding (exc | 0x40000000) flips REDUCTION (0b01) to PREFIX (0b10)
+            // because 0b01 + 0b01 = 0b10
+            Atomic::add(
+                &histograms[partition_offset + partition_base],
+                exc | (1u32 << 30),
+            );
+        }
+    }
+
+    sync_cube();
+
+    // After this:
+    // - scatter_smem[digit] = global exclusive prefix for this workgroup
+    // - smem[digit] = local histogram (unchanged, needed for Step 5)
 }
 
 #[cube(launch)]
@@ -169,6 +264,7 @@ fn kernel_scatter(
 
     let lane_mask_lt = Line::new((1u32 << UNIT_POS_PLANE) - 1u32);
 
+    // Compute local count + rank for each item in tile and store in kr
     fill_kv(keys_in, &mut kv, num_elements);
     for j in 0..TILE_SIZE_U32 {
         let digit = extract_digit(pass, kv[j]);
@@ -201,10 +297,46 @@ fn kernel_scatter(
     // Shared memory for block-level histogram
     let smem: SharedMemory<Atomic<u32>> = SharedMemory::<Atomic<u32>>::new(HISTOGRAM_SIZE_U32);
 
+    // First zero it out
     if UNIT_POS < HISTOGRAM_SIZE_U32 {
         Atomic::store(&smem[UNIT_POS], 0u32);
     }
+
     sync_cube();
+
+    let plane_id = UNIT_POS / PLANE_DIM;
+    let num_planes = CUBE_DIM / PLANE_DIM;
+
+    // Sequential - each "plane" waits for the previous one to finish (hence the sync_cube())
+    #[unroll]
+    for i in 0..num_planes {
+        if plane_id == i {
+            for j in 0..TILE_SIZE_U32 {
+                let digit = extract_digit(pass, kv[j]);
+                let prev = Atomic::load(&smem[digit]);
+
+                // Separate out rank and count from kr[j]
+                let rank = kr[j] & 0xFFFF;
+                let count = kr[j] >> 16;
+                // Update kr to workgroup-global rank
+                kr[j] = prev + rank;
+
+                // The rank will equal count in the last thread with this digit (since we used 1-based rank)
+                // Only the last thread with this digit updates histogram
+                //
+                if rank == count {
+                    Atomic::store(&smem[digit], prev + count);
+                }
+            }
+        }
+        sync_cube();
+    }
+
+    // Now:
+    // - smem[digit] contains local histogram (total count per digit in this tile)
+    // - kr[j] contains workgroup-global rank (1-indexed) for each key
+
+    // Step 4. Decoupled Lookback
 }
 
 fn main() {
