@@ -241,9 +241,6 @@ fn accumulate_local_histogram(
     // - kr[j] contains workgroup-global rank (1-indexed) for each key
 }
 
-const RADIX_SIZE: u32 = 256;
-const NUM_PASSES: u32 = 4; // for 32-bit keys
-
 #[cube]
 fn decoupled_lookback(
     histograms: &Array<Atomic<u32>>,           // global histogram buffer
@@ -333,6 +330,41 @@ fn decoupled_lookback(
     // - smem[digit] = local histogram (unchanged, needed for Step 5)
 }
 
+#[cube]
+fn local_prefix_sum(smem: &SharedMemory<Atomic<u32>>, #[comptime] num_planes: u32) {
+    let lid = UNIT_POS;
+    let plane_idx = lid / PLANE_DIM;
+
+    // Inter-plane communication
+    let mut shared_totals = SharedMemory::<u32>::new(num_planes);
+
+    // 1. Local scan within plane
+    let original = Atomic::load(&smem[lid]);
+    let local_scan = plane_exclusive_sum(original);
+
+    // 2. Plane totals -> shared memory
+    let plane_total =
+        plane_shuffle(local_scan, PLANE_DIM - 1) + plane_shuffle(original, PLANE_DIM - 1);
+
+    if UNIT_POS_PLANE == 0 {
+        shared_totals[plane_idx] = plane_total;
+    }
+    sync_cube();
+
+    // 3. Scan totals (single plane or serial)
+    if plane_idx == 0 && UNIT_POS_PLANE < num_planes {
+        let offset = plane_exclusive_sum(shared_totals[UNIT_POS_PLANE]);
+        shared_totals[UNIT_POS_PLANE] = offset;
+    }
+    sync_cube();
+
+    // 4. Apply offset from previous planes
+    let result = local_scan + shared_totals[plane_idx];
+    Atomic::store(&smem[lid], result);
+
+    sync_cube();
+}
+
 #[cube(launch)]
 fn kernel_scatter(
     keys_in: &Array<u32>,
@@ -340,8 +372,9 @@ fn kernel_scatter(
     histograms: &Array<Atomic<u32>>,
     partition_status: &mut Array<Atomic<u32>>,
     partition_mask_info: &ParitionMaskInfo,
-    #[comptime] num_elements: u32,
     #[comptime] pass: u32,
+    #[comptime] num_elements: u32,
+    #[comptime] num_planes: u32,
 ) {
     // Allocate registers/local memory for the current "tile" of keys
     let mut kv = Array::<u32>::new(comptime!(TILE_SIZE_U32));
@@ -349,12 +382,15 @@ fn kernel_scatter(
     // kr will hold (count | rank) for current tile's digits
     let mut kr = Array::<u32>::new(comptime!(TILE_SIZE_U32));
 
-    // Compute local count + rank for each item in tile and store in kr
+    // Step 1: Read keys from global memory
     fill_kv(keys_in, &mut kv, num_elements);
+
+    // Step 2: Compute local count + rank for each item in tile and store in kr
     compute_local_count_and_rank(&kv, &mut kr, pass);
 
     // Shared memory for block-level histogram
     let smem: SharedMemory<Atomic<u32>> = SharedMemory::<Atomic<u32>>::new(HISTOGRAM_SIZE_U32);
+    // Step 3: Accumulate local histogram
     accumulate_local_histogram(&kv, &mut kr, &smem, pass);
 
     // Step 4. Decoupled Lookback
@@ -367,6 +403,13 @@ fn kernel_scatter(
         pass,
         partition_mask_info,
     );
+
+    // Step 5: Prefix scan of local histogram in shared memory
+    // restrict to first HISTOGRAM_SIZE_U32 threads
+    if UNIT_POS < HISTOGRAM_SIZE_U32 {
+        local_prefix_sum(&smem, num_planes);
+    }
+    sync_cube();
 }
 
 fn main() {
@@ -375,7 +418,7 @@ fn main() {
 
     type R = cubecl::wgpu::WgpuRuntime;
 
-    let input_data = vec![1; 2 * 3840];
+    let input_data = vec![1u32; 3840 * 2];
     let num_elements = input_data.len();
 
     const ELEM_SIZE: usize = std::mem::size_of::<u32>();
