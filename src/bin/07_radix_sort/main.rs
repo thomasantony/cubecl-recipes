@@ -664,13 +664,12 @@ pub fn radix_sort_u32<R: Runtime>(client: &ComputeClient<R::Server>, input: &[u3
         );
     }
 
-    // Zero-initialize partition buffer (required for lookback)
-    // Even passes see 0 as INVALID, odd passes see 0x80000000 as INVALID
-    // The alternating mask trick means we don't need to re-zero between passes
+    // Single partition buffer - sync between passes to prevent overlap
+    // (The alternating mask scheme requires passes to complete sequentially)
     let partition_zeros = vec![0u32; num_blocks * HISTOGRAM_SIZE];
     let partition_status = client.create(u32::as_bytes(&partition_zeros));
 
-    // Step 3: Run all 4 scatter passes
+    // Step 3: Run all 4 scatter passes with sync between each
     // Pass 0 (even): keys_a → keys_b
     run_scatter_pass::<R>(
         client,
@@ -683,6 +682,7 @@ pub fn radix_sort_u32<R: Runtime>(client: &ComputeClient<R::Server>, input: &[u3
         num_blocks,
         num_planes,
     );
+    pollster::block_on(client.sync());
 
     // Pass 1 (odd): keys_b → keys_a
     run_scatter_pass::<R>(
@@ -696,6 +696,7 @@ pub fn radix_sort_u32<R: Runtime>(client: &ComputeClient<R::Server>, input: &[u3
         num_blocks,
         num_planes,
     );
+    pollster::block_on(client.sync());
 
     // Pass 2 (even): keys_a → keys_b
     run_scatter_pass::<R>(
@@ -709,6 +710,7 @@ pub fn radix_sort_u32<R: Runtime>(client: &ComputeClient<R::Server>, input: &[u3
         num_blocks,
         num_planes,
     );
+    pollster::block_on(client.sync());
 
     // Pass 3 (odd): keys_b → keys_a
     run_scatter_pass::<R>(
@@ -722,12 +724,146 @@ pub fn radix_sort_u32<R: Runtime>(client: &ComputeClient<R::Server>, input: &[u3
         num_blocks,
         num_planes,
     );
-
     // Final result is in keys_a - truncate to original length
     // (padding values 0xFFFFFFFF sort to the end)
     let result = client.read_one(keys_a.clone());
     let sorted = u32::from_bytes(&result);
     sorted[..original_len].to_vec()
+}
+
+/// Sort buffers for GPU-only radix sort (no CPU transfers during sort)
+pub struct RadixSortBuffers {
+    pub keys_a: Handle,
+    pub keys_b: Handle,
+    pub padded_size: usize,
+    pub original_len: usize,
+    pub num_blocks: usize,
+    pub num_planes: u32,
+}
+
+/// Create reusable sort buffers for a given size.
+/// Call this once, then use `radix_sort_u32_gpu` for GPU-only sorting.
+pub fn create_sort_buffers<R: Runtime>(
+    client: &ComputeClient<R::Server>,
+    max_elements: usize,
+) -> RadixSortBuffers {
+    const ELEM_SIZE: usize = std::mem::size_of::<u32>();
+
+    let padded_size = max_elements.next_multiple_of(SCATTER_BLOCK_KVS);
+    let num_blocks = padded_size / SCATTER_BLOCK_KVS;
+
+    let keys_a = client.empty(padded_size * ELEM_SIZE);
+    let keys_b = client.empty(padded_size * ELEM_SIZE);
+
+    let num_planes = PREFIX_BLOCK_SIZE as u32 / PLANE_DIM;
+
+    RadixSortBuffers {
+        keys_a,
+        keys_b,
+        padded_size,
+        original_len: max_elements,
+        num_blocks,
+        num_planes,
+    }
+}
+
+/// GPU-only radix sort: sorts data already in keys_a buffer.
+/// Result ends up in keys_a. Does NOT sync - call client.sync() after if needed.
+pub fn radix_sort_u32_gpu<R: Runtime>(
+    client: &ComputeClient<R::Server>,
+    buffers: &RadixSortBuffers,
+) {
+    let RadixSortBuffers {
+        keys_a,
+        keys_b,
+        padded_size,
+        num_blocks,
+        num_planes,
+        ..
+    } = buffers;
+
+    // Create histogram buffer (small: 4 * 256 = 1KB)
+    let histo_zeros = vec![0u32; NUM_DIGITS * HISTOGRAM_SIZE];
+    let histograms = client.create(u32::as_bytes(&histo_zeros));
+
+    // Create partition buffer (small relative to data)
+    let partition_zeros = vec![0u32; *num_blocks * HISTOGRAM_SIZE];
+    let partition_status = client.create(u32::as_bytes(&partition_zeros));
+
+    // Step 1: Calculate histogram
+    unsafe {
+        kernel_calc_histogram::launch_unchecked::<R>(
+            client,
+            CubeCount::Static(*num_blocks as u32, 1, 1),
+            CubeDim::new(HISTOGRAM_BLOCK_SIZE as u32, 1, 1),
+            ArrayArg::from_raw_parts::<u32>(keys_a, *padded_size, 1),
+            ArrayArg::from_raw_parts::<u32>(&histograms, NUM_DIGITS * HISTOGRAM_SIZE, 1),
+        );
+    }
+
+    // Step 2: Prefix sum histogram
+    unsafe {
+        kernel_prefix_histogram::launch_unchecked::<R>(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new(PREFIX_BLOCK_SIZE as u32, 1, 1),
+            ArrayArg::from_raw_parts::<u32>(&histograms, NUM_DIGITS * HISTOGRAM_SIZE, 1),
+            *num_planes,
+        );
+    }
+
+    // Step 3: Run all 4 scatter passes with sync between each
+    run_scatter_pass::<R>(
+        client,
+        keys_a,
+        keys_b,
+        &histograms,
+        &partition_status,
+        0,
+        *padded_size,
+        *num_blocks,
+        *num_planes,
+    );
+    pollster::block_on(client.sync());
+
+    run_scatter_pass::<R>(
+        client,
+        keys_b,
+        keys_a,
+        &histograms,
+        &partition_status,
+        1,
+        *padded_size,
+        *num_blocks,
+        *num_planes,
+    );
+    pollster::block_on(client.sync());
+
+    run_scatter_pass::<R>(
+        client,
+        keys_a,
+        keys_b,
+        &histograms,
+        &partition_status,
+        2,
+        *padded_size,
+        *num_blocks,
+        *num_planes,
+    );
+    pollster::block_on(client.sync());
+
+    run_scatter_pass::<R>(
+        client,
+        keys_b,
+        keys_a,
+        &histograms,
+        &partition_status,
+        3,
+        *padded_size,
+        *num_blocks,
+        *num_planes,
+    );
+    // Result is now in keys_a
 }
 
 fn main() {
@@ -737,7 +873,7 @@ fn main() {
     type R = cubecl::wgpu::WgpuRuntime;
 
     // Test with non-aligned size to verify padding works
-    let count = 50000u32; // Not a multiple of 3840
+    let count = 35000u32; // Not a multiple of 3840
     let input_data: Vec<u32> = (1..=count).rev().collect();
     println!(
         "Sorting {} elements (padded to {})...",
