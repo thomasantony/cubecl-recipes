@@ -55,23 +55,23 @@ fn odd_partition_mask_info<'a, R: Runtime>() -> PartitionMaskInfoLaunch<'a, R> {
 }
 
 // Copy keys from global memory to local memory
-// Uses subgroup-based loading for coalescing while maintaining stability
+// Uses plane-based loading for coalescing while maintaining stability
 #[cube]
 fn fill_kv(input_data: &Array<u32>, kv: &mut Array<u32>, num_elements: u32) {
     let block_keyvals = CUBE_DIM * TILE_SIZE_U32;
-    let subgroup_keyvals = PLANE_DIM * TILE_SIZE_U32;
+    let plane_keyvals = PLANE_DIM * TILE_SIZE_U32;
 
-    let subgroup_id = UNIT_POS / PLANE_DIM;
-    let subgroup_lane = UNIT_POS % PLANE_DIM;
+    let plane_id = UNIT_POS / PLANE_DIM;
+    let plane_lane = UNIT_POS % PLANE_DIM;
 
-    // Each subgroup gets a contiguous block of subgroup_keyvals elements
-    // Within the subgroup, threads stride by PLANE_DIM for coalescing
+    // Each plane gets a contiguous block of plane_keyvals elements
+    // Within the plane, threads stride by PLANE_DIM for coalescing
     //
-    // Memory layout per workgroup:
-    // [subgroup 0's data][subgroup 1's data][subgroup 2's data]...
-    // Within each subgroup block: stride by PLANE_DIM
+    // Memory layout per block:
+    // [plane 0's data][plane 1's data][plane 2's data]...
+    // Within each plane's block: stride by PLANE_DIM
     //
-    let kv_in_offset = CUBE_POS * block_keyvals + subgroup_id * subgroup_keyvals + subgroup_lane;
+    let kv_in_offset = CUBE_POS * block_keyvals + plane_id * plane_keyvals + plane_lane;
 
     for i in 0u32..comptime!(TILE_SIZE as u32) {
         let idx = kv_in_offset + i * PLANE_DIM;
@@ -249,7 +249,7 @@ fn accumulate_local_histogram(
                 // Separate out rank and count from kr[j]
                 let rank = kr[j] & 0xFFFF;
                 let count = kr[j] >> 16;
-                // Update kr to workgroup-global rank
+                // Update kr to block-global rank
                 kr[j] = prev + rank;
 
                 // The rank will equal count in the last thread with this digit (since we used 1-based rank)
@@ -265,7 +265,7 @@ fn accumulate_local_histogram(
 
     // Now:
     // - smem[digit] contains local histogram (total count per digit in this tile)
-    // - kr[j] contains workgroup-global rank (1-indexed) for each key
+    // - kr[j] contains block-global rank (1-indexed) for each key
 }
 
 #[cube]
@@ -301,7 +301,7 @@ fn decoupled_lookback(
     } else {
         // All the later blocks
 
-        // Publish local reduction first (so later workgroups can see us)
+        // Publish local reduction first (so later blocks can see us)
         if UNIT_POS < HISTOGRAM_SIZE_U32 {
             let local_reduction = Atomic::load(&smem_histogram[UNIT_POS]);
             Atomic::store(
@@ -353,7 +353,7 @@ fn decoupled_lookback(
     sync_cube();
 
     // After this:
-    // - global_prefix_smem[digit] = global exclusive prefix for this workgroup
+    // - global_prefix_smem[digit] = global exclusive prefix for this block
     // - smem[digit] = local histogram (unchanged, needed for Step 5)
 }
 
@@ -422,11 +422,11 @@ fn reorder_in_shared_memory(
     kr: &mut Array<u32>,
     reorder_smem: &mut SharedMemory<u32>, // size = tile_size
 ) {
-    // Gather pattern must match fill_kv's loading pattern (subgroup-based)
-    let subgroup_keyvals = PLANE_DIM * TILE_SIZE_U32;
-    let subgroup_id = UNIT_POS / PLANE_DIM;
-    let subgroup_lane = UNIT_POS % PLANE_DIM;
-    let base_idx = subgroup_id * subgroup_keyvals + subgroup_lane;
+    // Gather pattern must match fill_kv's loading pattern (plane-based)
+    let plane_keyvals = PLANE_DIM * TILE_SIZE_U32;
+    let plane_id = UNIT_POS / PLANE_DIM;
+    let plane_lane = UNIT_POS % PLANE_DIM;
+    let base_idx = plane_id * plane_keyvals + plane_lane;
 
     // --- Scatter keys to sorted positions ---
     #[unroll]
@@ -437,7 +437,7 @@ fn reorder_in_shared_memory(
 
     sync_cube();
 
-    // --- Gather keys back in subgroup-strided order ---
+    // --- Gather keys back in plane-strided order ---
     #[unroll]
     for j in 0..TILE_SIZE_U32 {
         let smem_idx = base_idx + j * PLANE_DIM;
@@ -455,7 +455,7 @@ fn reorder_in_shared_memory(
 
     sync_cube();
 
-    // --- Gather kr back in subgroup-strided order ---
+    // --- Gather kr back in plane-strided order ---
     #[unroll]
     for j in 0..TILE_SIZE_U32 {
         let smem_idx = base_idx + j * PLANE_DIM;
@@ -469,7 +469,7 @@ fn reorder_in_shared_memory(
 ///
 /// Before: kv[j] = keys in digit-sorted order within tile
 ///         kr[j] = rank within digit group (1-indexed)
-///         scatter_smem[digit] = global exclusive prefix for this workgroup
+///         scatter_smem[digit] = global exclusive prefix for this block
 /// After:  kr[j] = final global output index
 #[cube]
 fn local_to_global_index(
