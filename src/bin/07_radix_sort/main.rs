@@ -56,19 +56,56 @@ fn odd_partition_mask_info<'a, R: Runtime>() -> PartitionMaskInfoLaunch<'a, R> {
 // Uses plane-based loading for coalescing while maintaining stability
 #[cube]
 fn fill_kv(input_data: &Array<u32>, kv: &mut Array<u32>) {
-    let block_keyvals = CUBE_DIM * TILE_SIZE_U32;
-    let plane_keyvals = PLANE_DIM * TILE_SIZE_U32;
+    // RS_HISTOGRAM_BLOCK_ROWS = 15 // items per thread
+    // wg_size = CUBE_DIM
+    // let rs_block_keyvals: u32 = rs_histogram_block_rows * histogram_wg_size;
+    // let kv_in_offset = wid * rs_block_keyvals + lid;
+    // for (var i = 0u; i < rs_histogram_block_rows; i++) {
+    //     let pos = kv_in_offset + i * histogram_wg_size;
+    //     kv[i] = keys[pos];
+    // }
 
-    let plane_id = UNIT_POS / PLANE_DIM;
-    let plane_lane = UNIT_POS % PLANE_DIM;
+    let block_keyvals = CUBE_DIM * TILE_SIZE_U32;
 
     // Each plane gets a contiguous block of plane_keyvals elements
     // Within the plane, threads stride by PLANE_DIM for coalescing
-    let kv_in_offset = CUBE_POS * block_keyvals + plane_id * plane_keyvals + plane_lane;
+    let kv_in_offset = CUBE_POS * block_keyvals + UNIT_POS;
 
     for i in 0u32..comptime!(TILE_SIZE as u32) {
-        let idx = kv_in_offset + i * PLANE_DIM;
-        kv[i] = input_data[idx];
+        let pos = kv_in_offset + i * CUBE_DIM;
+        kv[i] = input_data[pos];
+    }
+}
+
+#[cube]
+fn fill_kv_scatter(keys: &Array<u32>, kv: &mut Array<u32>) {
+    // histogram_sg_size = PLANE_DIM
+    // rs_histogram_block_rows = TILE_SIZE_U32
+    // fn fill_kv_even(wid: u32, lid: u32) {
+    //     let subgroup_id = lid / histogram_sg_size;
+    //     let subgroup_invoc_id = lid - subgroup_id * histogram_sg_size;
+    //     let subgroup_keyvals = rs_scatter_block_rows * histogram_sg_size;
+    //     let rs_block_keyvals: u32 = rs_histogram_block_rows * histogram_wg_size;
+    //     let kv_in_offset = wid * rs_block_keyvals + subgroup_id * subgroup_keyvals + subgroup_invoc_id;
+    //     for (var i = 0u; i < rs_histogram_block_rows; i++) {
+    //         let pos = kv_in_offset + i * histogram_sg_size;
+    //         kv[i] = keys[pos];
+    //     }
+    //     for (var i = 0u; i < rs_histogram_block_rows; i++) {
+    //         let pos = kv_in_offset + i * histogram_sg_size;
+    //         pv[i] = payload_a[pos];
+    //     }
+    // }
+
+    let plane_id = UNIT_POS / PLANE_DIM;
+    let plane_invoc_id = UNIT_POS - plane_id * PLANE_DIM;
+    let plane_keyvals = TILE_SIZE_U32 * PLANE_DIM;
+    let rs_block_keyvals: u32 = TILE_SIZE_U32 * CUBE_DIM;
+    let kv_in_offset = CUBE_POS * rs_block_keyvals + plane_id * plane_keyvals + plane_invoc_id;
+
+    for i in 0u32..TILE_SIZE_U32 {
+        let pos = kv_in_offset + i * PLANE_DIM;
+        kv[i] = keys[pos];
     }
 }
 
@@ -102,7 +139,7 @@ fn histogram_pass(
     }
 }
 
-#[cube(launch)]
+#[cube(launch_unchecked)]
 fn kernel_calc_histogram(input_data: &Array<u32>, histograms: &mut Array<Atomic<u32>>) {
     // Allocate registers/local memory for the current "tile" of keys
     let mut kv = Array::<u32>::new(comptime!(TILE_SIZE as u32));
@@ -152,7 +189,7 @@ fn prefix_histogram_pass(pass: u32, histograms: &mut Array<u32>, #[comptime] num
 }
 
 // Assume prefix_histogram is launched with 256-thread blocks
-#[cube(launch)]
+#[cube(launch_unchecked)]
 fn kernel_prefix_histogram(histograms: &mut Array<u32>, #[comptime] num_planes: u32) {
     prefix_histogram_pass(0u32, histograms, num_planes);
     prefix_histogram_pass(1u32, histograms, num_planes);
@@ -174,12 +211,10 @@ fn compute_local_count_and_rank(kv: &Array<u32>, kr: &mut Array<u32>, pass: u32)
 
         let mut match_mask = Line::<u32>::new(0xFFFFFFFFu32);
         // Unrolled for 8-bit digit
-        #[unroll]
         for bit in 0u32..8u32 {
             let my_bit = (digit >> bit) & 1u32;
             let predicate = my_bit == 1u32;
             let ballot = plane_ballot(predicate);
-
             let mask_for_bit = Line::new(ballot[0] ^ (0u32 - (1u32 - my_bit)));
             match_mask = match_mask & mask_for_bit;
         }
@@ -270,6 +305,7 @@ fn decoupled_lookback(
                 &partition_status[UNIT_POS],
                 inc | partition_mask_info.mask_prefix,
             );
+            sync_storage();
         }
     } else {
         // All the later blocks
@@ -281,6 +317,7 @@ fn decoupled_lookback(
                 &partition_status[partition_base + UNIT_POS],
                 local_reduction | partition_mask_info.mask_reduction,
             );
+            sync_storage();
         }
 
         // Look back to compute exclusive prefix
@@ -320,6 +357,7 @@ fn decoupled_lookback(
                 &partition_status[UNIT_POS + partition_base],
                 global_prefix | (1u32 << 30),
             );
+            sync_storage();
         }
     }
 
@@ -471,7 +509,7 @@ fn store_to_global(kv: &Array<u32>, kr: &Array<u32>, keys_out: &mut Array<u32>) 
     }
 }
 
-#[cube(launch)]
+#[cube(launch_unchecked)]
 fn kernel_scatter(
     keys_in: &Array<u32>,
     keys_out: &mut Array<u32>,
@@ -488,7 +526,7 @@ fn kernel_scatter(
     let mut kr = Array::<u32>::new(comptime!(TILE_SIZE_U32));
 
     // Step 1: Read keys from global memory
-    fill_kv(keys_in, &mut kv);
+    fill_kv_scatter(keys_in, &mut kv);
 
     // Step 2: Compute local count + rank for each item in tile and store in kr
     compute_local_count_and_rank(&kv, &mut kr, pass);
@@ -555,7 +593,7 @@ fn run_scatter_pass<R: Runtime>(
     };
 
     unsafe {
-        kernel_scatter::launch::<R>(
+        kernel_scatter::launch_unchecked::<R>(
             client,
             CubeCount::Static(num_blocks as u32, 1, 1),
             CubeDim::new(SCATTER_BLOCK_SIZE as u32, 1, 1),
@@ -594,7 +632,7 @@ pub fn radix_sort_u32<R: Runtime>(client: &ComputeClient<R::Server>, input: &[u3
 
     // Step 1: Calculate histogram for all passes at once
     unsafe {
-        kernel_calc_histogram::launch::<R>(
+        kernel_calc_histogram::launch_unchecked::<R>(
             client,
             CubeCount::Static(num_blocks as u32, 1, 1),
             CubeDim::new(HISTOGRAM_BLOCK_SIZE as u32, 1, 1),
@@ -606,7 +644,7 @@ pub fn radix_sort_u32<R: Runtime>(client: &ComputeClient<R::Server>, input: &[u3
     // Step 2: Prefix sum each pass's histogram
     let num_planes = PREFIX_BLOCK_SIZE as u32 / PLANE_DIM;
     unsafe {
-        kernel_prefix_histogram::launch::<R>(
+        kernel_prefix_histogram::launch_unchecked::<R>(
             client,
             CubeCount::Static(1, 1, 1),
             CubeDim::new(PREFIX_BLOCK_SIZE as u32, 1, 1),
@@ -635,6 +673,10 @@ pub fn radix_sort_u32<R: Runtime>(client: &ComputeClient<R::Server>, input: &[u3
         num_planes,
     );
 
+    let result = client.read_one(keys_b.clone());
+    let foo = u32::from_bytes(&result).to_vec();
+    println!("keys_b: {:?}", &foo[..16]);
+
     // Pass 1 (odd): keys_b → keys_a
     run_scatter_pass::<R>(
         client,
@@ -648,6 +690,10 @@ pub fn radix_sort_u32<R: Runtime>(client: &ComputeClient<R::Server>, input: &[u3
         num_planes,
     );
 
+    let result = client.read_one(keys_a.clone());
+    let foo = u32::from_bytes(&result).to_vec();
+    println!("keys_a: {:?}", &foo[..16]);
+
     // Pass 2 (even): keys_a → keys_b
     run_scatter_pass::<R>(
         client,
@@ -660,6 +706,9 @@ pub fn radix_sort_u32<R: Runtime>(client: &ComputeClient<R::Server>, input: &[u3
         num_blocks,
         num_planes,
     );
+    let result = client.read_one(keys_b.clone());
+    let foo = u32::from_bytes(&result).to_vec();
+    println!("keys_b: {:?}", &foo[..16]);
 
     // Pass 3 (odd): keys_b → keys_a
     run_scatter_pass::<R>(
@@ -673,6 +722,9 @@ pub fn radix_sort_u32<R: Runtime>(client: &ComputeClient<R::Server>, input: &[u3
         num_blocks,
         num_planes,
     );
+    let result = client.read_one(keys_a.clone());
+    let foo = u32::from_bytes(&result).to_vec();
+    println!("keys_a: {:?}", &foo[..16]);
 
     // Final result is in keys_a
     let result = client.read_one(keys_a.clone());
