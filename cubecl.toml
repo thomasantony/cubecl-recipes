@@ -1,9 +1,9 @@
 [profiling]
-logger = { level = "full", stdout = true }
+logger = { level = "basic", stdout = false }
 
 [autotune]
 level = "balanced"
-logger = { level = "minimal", stdout = true }
+logger = { level = "minimal", stdout = false }
 
 [compilation]
 logger = { level = "basic", file = "cubecl.log", append = true }
