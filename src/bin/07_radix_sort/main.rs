@@ -1,6 +1,7 @@
-// tile size of 15? -> each thread will process 15 elements
+// GPU Radix Sort using CubeCL
+// Based on wgpu_sort / Fuchsia implementation with decoupled look-back
 
-const TILE_SIZE: usize = 15; // matching original impl
+const TILE_SIZE: usize = 15;
 const TILE_SIZE_U32: u32 = TILE_SIZE as u32;
 
 const BITS_PER_PASS: u32 = 8;
@@ -9,12 +10,9 @@ const HISTOGRAM_SIZE: usize = 1 << BITS_PER_PASS;
 const HISTOGRAM_SIZE_U32: u32 = HISTOGRAM_SIZE as u32;
 
 const HISTOGRAM_BLOCK_SIZE: usize = 256;
-// const PREFIX_BLOCK_SIZE: usize = HISTOGRAM_SIZE / 2;
 const PREFIX_BLOCK_SIZE: usize = HISTOGRAM_SIZE;
 const SCATTER_BLOCK_SIZE: usize = 256;
 const SCATTER_BLOCK_KVS: usize = SCATTER_BLOCK_SIZE * TILE_SIZE;
-
-const HISTOGRAM_BLOCK_SIZE_U32: u32 = HISTOGRAM_BLOCK_SIZE as u32;
 
 use cubecl::client::ComputeClient;
 use cubecl::prelude::*;
@@ -179,17 +177,6 @@ const STATUS_MASK: u32 = 0xC0000000u32; // top 2 bits
 const COUNT_MASK: u32 = 0x3FFFFFFFu32; // bottom 30 bits
 
 #[cube]
-fn popcount(x: u32) -> u32 {
-    let mut v = x;
-    v = v - ((v >> 1u32) & 0x55555555u32);
-    v = (v & 0x33333333u32) + ((v >> 2u32) & 0x33333333u32);
-    v = (v + (v >> 4u32)) & 0x0F0F0F0Fu32;
-    v = v + (v >> 8u32);
-    v = v + (v >> 16u32);
-    v & 0x3Fu32
-}
-
-#[cube]
 fn compute_local_count_and_rank(kv: &Array<u32>, kr: &mut Array<u32>, pass: u32) {
     let lane_mask_lt = Line::new((1u32 << UNIT_POS_PLANE) - 1u32);
 
@@ -276,7 +263,6 @@ fn decoupled_lookback(
     global_prefix_smem: &mut SharedMemory<u32>, // to cache global prefix
     pass: u32,
     partition_mask_info: &PartitionMaskInfo,
-    debug_buffer: &mut Array<u32>,
 ) {
     let partition_base = CUBE_POS * HISTOGRAM_SIZE_U32;
 
@@ -490,11 +476,14 @@ fn local_to_global_index(
 
 /// Step 9: Store keys to global memory
 #[cube]
-fn store_to_global(kv: &Array<u32>, kr: &Array<u32>, keys_out: &mut Array<u32>) {
+fn store_to_global(kv: &Array<u32>, kr: &Array<u32>, keys_out: &mut Array<u32>, num_elements: u32) {
     #[unroll]
     for j in 0..TILE_SIZE_U32 {
         let global_idx = kr[j];
-        keys_out[global_idx] = kv[j];
+        // Only write if within bounds (handles non-aligned sizes)
+        if global_idx < num_elements {
+            keys_out[global_idx] = kv[j];
+        }
     }
 }
 
@@ -504,9 +493,8 @@ fn kernel_scatter(
     keys_out: &mut Array<u32>,
     histograms: &Array<Atomic<u32>>,
     partition_status: &mut Array<Atomic<u32>>,
-    debug_buffer: &mut Array<u32>,
     partition_mask_info: &PartitionMaskInfo,
-    pass: u32,  // Runtime parameter - changes per pass
+    pass: u32, // Runtime parameter - changes per pass
     #[comptime] num_elements: u32,
     #[comptime] num_planes: u32,
 ) {
@@ -543,7 +531,6 @@ fn kernel_scatter(
         &mut global_prefix_smem,
         pass,
         partition_mask_info,
-        debug_buffer,
     );
 
     // Step 5: Prefix scan of local histogram in shared memory
@@ -563,7 +550,7 @@ fn kernel_scatter(
     local_to_global_index(&kv, &mut kr, &global_prefix_smem, pass);
 
     // Step 9
-    store_to_global(&kv, &kr, keys_out);
+    store_to_global(&kv, &kr, keys_out, num_elements);
 }
 
 /// Run one scatter pass
@@ -573,7 +560,6 @@ fn run_scatter_pass<R: Runtime>(
     keys_out: &Handle,
     histograms: &Handle,
     partition_status: &Handle,
-    debug_buffer: &Handle,
     pass: u32,
     num_elements: usize,
     num_blocks: usize,
@@ -594,7 +580,6 @@ fn run_scatter_pass<R: Runtime>(
             ArrayArg::from_raw_parts::<u32>(keys_out, num_elements, 1),
             ArrayArg::from_raw_parts::<u32>(histograms, NUM_DIGITS * HISTOGRAM_SIZE, 1),
             ArrayArg::from_raw_parts::<u32>(partition_status, num_blocks * HISTOGRAM_SIZE, 1),
-            ArrayArg::from_raw_parts::<u32>(debug_buffer, NUM_DIGITS * HISTOGRAM_SIZE, 1),
             partition_mask,
             ScalarArg::new(pass),
             num_elements as u32,
@@ -603,14 +588,13 @@ fn run_scatter_pass<R: Runtime>(
     }
 }
 
-fn main() {
-    let device = Default::default();
-    let client = cubecl::wgpu::WgpuRuntime::client(&device);
-
-    type R = cubecl::wgpu::WgpuRuntime;
-
-    let input_data: Vec<u32> = (1..=(3840 * 2)).collect();
-    let num_elements = input_data.len();
+/// Sort u32 values in-place using GPU radix sort.
+/// Returns the sorted data.
+pub fn radix_sort_u32<R: Runtime>(client: &ComputeClient<R::Server>, input: &[u32]) -> Vec<u32> {
+    let num_elements = input.len();
+    if num_elements == 0 {
+        return vec![];
+    }
 
     const ELEM_SIZE: usize = std::mem::size_of::<u32>();
 
@@ -620,14 +604,12 @@ fn main() {
     // Pass 2: keys_a → keys_b (sort by bits 16-23)
     // Pass 3: keys_b → keys_a (sort by bits 24-31)
     // Final result in keys_a
-    let keys_a = client.create(u32::as_bytes(&input_data));
+    let keys_a = client.create(u32::as_bytes(input));
     let keys_b = client.empty(num_elements * ELEM_SIZE);
 
     // Zero-initialize histogram buffer (required for atomic adds)
     let histo_zeros = vec![0u32; NUM_DIGITS * HISTOGRAM_SIZE];
     let histograms = client.create(u32::as_bytes(&histo_zeros));
-
-    let debug_buffer = client.empty(NUM_DIGITS * HISTOGRAM_SIZE * ELEM_SIZE);
 
     // Each block processes SCATTER_BLOCK_KVS keys (256 threads × 15 items = 3840)
     let num_blocks = num_elements.div_ceil(SCATTER_BLOCK_KVS);
@@ -635,7 +617,7 @@ fn main() {
     // Step 1: Calculate histogram for all passes at once
     unsafe {
         kernel_calc_histogram::launch::<R>(
-            &client,
+            client,
             CubeCount::Static(num_blocks as u32, 1, 1),
             CubeDim::new(HISTOGRAM_BLOCK_SIZE as u32, 1, 1),
             ArrayArg::from_raw_parts::<u32>(&keys_a, num_elements, 1),
@@ -648,7 +630,7 @@ fn main() {
     let num_planes = PREFIX_BLOCK_SIZE as u32 / PLANE_DIM;
     unsafe {
         kernel_prefix_histogram::launch::<R>(
-            &client,
+            client,
             CubeCount::Static(1, 1, 1),
             CubeDim::new(PREFIX_BLOCK_SIZE as u32, 1, 1),
             ArrayArg::from_raw_parts::<u32>(&histograms, NUM_DIGITS * HISTOGRAM_SIZE, 1),
@@ -662,77 +644,88 @@ fn main() {
     let partition_zeros = vec![0u32; num_blocks * HISTOGRAM_SIZE];
     let partition_status = client.create(u32::as_bytes(&partition_zeros));
 
-    println!("Running 4 scatter passes...");
-
-    // Helper to verify sorting by specific bits
-    let verify_pass = |data: &[u32], pass: u32, label: &str| {
-        let shift = pass * 8;
-        let mut ok = true;
-        for i in 1..data.len() {
-            let prev_digit = (data[i-1] >> shift) & 0xFF;
-            let curr_digit = (data[i] >> shift) & 0xFF;
-            if curr_digit < prev_digit {
-                println!("{}: FAIL at {}: {} (digit {}) > {} (digit {})",
-                    label, i, data[i-1], prev_digit, data[i], curr_digit);
-                ok = false;
-                break;
-            }
-        }
-        if ok {
-            println!("{}: OK - first 10: {:?}", label, &data[..10]);
-        }
-    };
-
     // Step 3: Run all 4 scatter passes
     // Pass 0 (even): keys_a → keys_b
     run_scatter_pass::<R>(
-        &client, &keys_a, &keys_b, &histograms, &partition_status, &debug_buffer,
-        0, num_elements, num_blocks, num_planes,
+        client,
+        &keys_a,
+        &keys_b,
+        &histograms,
+        &partition_status,
+        0,
+        num_elements,
+        num_blocks,
+        num_planes,
     );
-    let result = client.read_one(keys_b.clone());
-    let data = u32::from_bytes(&result).to_vec();
-    verify_pass(&data, 0, "Pass 0");
 
     // Pass 1 (odd): keys_b → keys_a
     run_scatter_pass::<R>(
-        &client, &keys_b, &keys_a, &histograms, &partition_status, &debug_buffer,
-        1, num_elements, num_blocks, num_planes,
+        client,
+        &keys_b,
+        &keys_a,
+        &histograms,
+        &partition_status,
+        1,
+        num_elements,
+        num_blocks,
+        num_planes,
     );
-    let result = client.read_one(keys_a.clone());
-    let data = u32::from_bytes(&result).to_vec();
-    verify_pass(&data, 1, "Pass 1");
 
     // Pass 2 (even): keys_a → keys_b
     run_scatter_pass::<R>(
-        &client, &keys_a, &keys_b, &histograms, &partition_status, &debug_buffer,
-        2, num_elements, num_blocks, num_planes,
+        client,
+        &keys_a,
+        &keys_b,
+        &histograms,
+        &partition_status,
+        2,
+        num_elements,
+        num_blocks,
+        num_planes,
     );
-    let result = client.read_one(keys_b.clone());
-    let data = u32::from_bytes(&result).to_vec();
-    verify_pass(&data, 2, "Pass 2");
 
     // Pass 3 (odd): keys_b → keys_a
     run_scatter_pass::<R>(
-        &client, &keys_b, &keys_a, &histograms, &partition_status, &debug_buffer,
-        3, num_elements, num_blocks, num_planes,
+        client,
+        &keys_b,
+        &keys_a,
+        &histograms,
+        &partition_status,
+        3,
+        num_elements,
+        num_blocks,
+        num_planes,
     );
 
     // Final result is in keys_a
     let result = client.read_one(keys_a.clone());
-    let output = u32::from_bytes(&result).to_vec();
+    u32::from_bytes(&result).to_vec()
+}
 
-    // Verify full sort
+fn main() {
+    let device = Default::default();
+    let client = cubecl::wgpu::WgpuRuntime::client(&device);
+
+    type R = cubecl::wgpu::WgpuRuntime;
+
+    // Test with non-aligned size (not a multiple of SCATTER_BLOCK_KVS = 3840)
+    let input_data: Vec<u32> = (1..=10000u32).rev().collect(); // 10000 elements, reversed
+    println!("Sorting {} elements...", input_data.len());
+
+    let output = radix_sort_u32::<R>(&client, &input_data);
+
+    // Verify
     let is_sorted = output.windows(2).all(|w| w[0] <= w[1]);
 
     if is_sorted {
         println!("FULLY SORTED! {} elements", output.len());
         println!("First 20: {:?}", &output[..20]);
-        println!("Last 20: {:?}", &output[output.len()-20..]);
+        println!("Last 20: {:?}", &output[output.len() - 20..]);
     } else {
         // Find first error
         for i in 1..output.len() {
-            if output[i] < output[i-1] {
-                println!("Sort error at {}: {} > {}", i, output[i-1], output[i]);
+            if output[i] < output[i - 1] {
+                println!("Sort error at {}: {} > {}", i, output[i - 1], output[i]);
                 break;
             }
         }
