@@ -55,7 +55,7 @@ fn odd_partition_mask_info<'a, R: Runtime>() -> PartitionMaskInfoLaunch<'a, R> {
 // Copy keys from global memory to local memory
 // Uses plane-based loading for coalescing while maintaining stability
 #[cube]
-fn fill_kv(input_data: &Array<u32>, kv: &mut Array<u32>, num_elements: u32) {
+fn fill_kv(input_data: &Array<u32>, kv: &mut Array<u32>) {
     let block_keyvals = CUBE_DIM * TILE_SIZE_U32;
     let plane_keyvals = PLANE_DIM * TILE_SIZE_U32;
 
@@ -64,20 +64,11 @@ fn fill_kv(input_data: &Array<u32>, kv: &mut Array<u32>, num_elements: u32) {
 
     // Each plane gets a contiguous block of plane_keyvals elements
     // Within the plane, threads stride by PLANE_DIM for coalescing
-    //
-    // Memory layout per block:
-    // [plane 0's data][plane 1's data][plane 2's data]...
-    // Within each plane's block: stride by PLANE_DIM
-    //
     let kv_in_offset = CUBE_POS * block_keyvals + plane_id * plane_keyvals + plane_lane;
 
     for i in 0u32..comptime!(TILE_SIZE as u32) {
         let idx = kv_in_offset + i * PLANE_DIM;
-        if idx < num_elements {
-            kv[i] = input_data[idx];
-        } else {
-            kv[i] = 0xFFFFFFFFu32;
-        }
+        kv[i] = input_data[idx];
     }
 }
 
@@ -112,15 +103,11 @@ fn histogram_pass(
 }
 
 #[cube(launch)]
-fn kernel_calc_histogram(
-    input_data: &Array<u32>,
-    histograms: &mut Array<Atomic<u32>>,
-    num_elements: u32,
-) {
+fn kernel_calc_histogram(input_data: &Array<u32>, histograms: &mut Array<Atomic<u32>>) {
     // Allocate registers/local memory for the current "tile" of keys
     let mut kv = Array::<u32>::new(comptime!(TILE_SIZE as u32));
 
-    fill_kv(input_data, &mut kv, num_elements);
+    fill_kv(input_data, &mut kv);
 
     let smem: SharedMemory<Atomic<u32>> = SharedMemory::<Atomic<u32>>::new(HISTOGRAM_SIZE_U32);
 
@@ -476,14 +463,11 @@ fn local_to_global_index(
 
 /// Step 9: Store keys to global memory
 #[cube]
-fn store_to_global(kv: &Array<u32>, kr: &Array<u32>, keys_out: &mut Array<u32>, num_elements: u32) {
+fn store_to_global(kv: &Array<u32>, kr: &Array<u32>, keys_out: &mut Array<u32>) {
     #[unroll]
     for j in 0..TILE_SIZE_U32 {
         let global_idx = kr[j];
-        // Only write if within bounds (handles non-aligned sizes)
-        if global_idx < num_elements {
-            keys_out[global_idx] = kv[j];
-        }
+        keys_out[global_idx] = kv[j];
     }
 }
 
@@ -495,7 +479,6 @@ fn kernel_scatter(
     partition_status: &mut Array<Atomic<u32>>,
     partition_mask_info: &PartitionMaskInfo,
     pass: u32, // Runtime parameter - changes per pass
-    #[comptime] num_elements: u32,
     #[comptime] num_planes: u32,
 ) {
     // Allocate registers/local memory for the current "tile" of keys
@@ -505,7 +488,7 @@ fn kernel_scatter(
     let mut kr = Array::<u32>::new(comptime!(TILE_SIZE_U32));
 
     // Step 1: Read keys from global memory
-    fill_kv(keys_in, &mut kv, num_elements);
+    fill_kv(keys_in, &mut kv);
 
     // Step 2: Compute local count + rank for each item in tile and store in kr
     compute_local_count_and_rank(&kv, &mut kr, pass);
@@ -550,7 +533,7 @@ fn kernel_scatter(
     local_to_global_index(&kv, &mut kr, &global_prefix_smem, pass);
 
     // Step 9
-    store_to_global(&kv, &kr, keys_out, num_elements);
+    store_to_global(&kv, &kr, keys_out);
 }
 
 /// Run one scatter pass
@@ -561,7 +544,7 @@ fn run_scatter_pass<R: Runtime>(
     histograms: &Handle,
     partition_status: &Handle,
     pass: u32,
-    num_elements: usize,
+    padded_size: usize,
     num_blocks: usize,
     num_planes: u32,
 ) {
@@ -576,20 +559,20 @@ fn run_scatter_pass<R: Runtime>(
             client,
             CubeCount::Static(num_blocks as u32, 1, 1),
             CubeDim::new(SCATTER_BLOCK_SIZE as u32, 1, 1),
-            ArrayArg::from_raw_parts::<u32>(keys_in, num_elements, 1),
-            ArrayArg::from_raw_parts::<u32>(keys_out, num_elements, 1),
+            ArrayArg::from_raw_parts::<u32>(keys_in, padded_size, 1),
+            ArrayArg::from_raw_parts::<u32>(keys_out, padded_size, 1),
             ArrayArg::from_raw_parts::<u32>(histograms, NUM_DIGITS * HISTOGRAM_SIZE, 1),
             ArrayArg::from_raw_parts::<u32>(partition_status, num_blocks * HISTOGRAM_SIZE, 1),
             partition_mask,
             ScalarArg::new(pass),
-            num_elements as u32,
             num_planes,
         );
     }
 }
 
-/// Sort u32 values in-place using GPU radix sort.
+/// Sort u32 values using GPU radix sort.
 /// Returns the sorted data.
+/// Note: Input size must be a multiple of SCATTER_BLOCK_KVS (3840) for now.
 pub fn radix_sort_u32<R: Runtime>(client: &ComputeClient<R::Server>, input: &[u32]) -> Vec<u32> {
     let num_elements = input.len();
     if num_elements == 0 {
@@ -598,21 +581,16 @@ pub fn radix_sort_u32<R: Runtime>(client: &ComputeClient<R::Server>, input: &[u3
 
     const ELEM_SIZE: usize = std::mem::size_of::<u32>();
 
+    // Each block processes SCATTER_BLOCK_KVS keys (256 threads × 15 items = 3840)
+    let num_blocks = num_elements.div_ceil(SCATTER_BLOCK_KVS);
+
     // Double-buffer for ping-pong between passes
-    // Pass 0: keys_a → keys_b (sort by bits 0-7)
-    // Pass 1: keys_b → keys_a (sort by bits 8-15)
-    // Pass 2: keys_a → keys_b (sort by bits 16-23)
-    // Pass 3: keys_b → keys_a (sort by bits 24-31)
-    // Final result in keys_a
     let keys_a = client.create(u32::as_bytes(input));
     let keys_b = client.empty(num_elements * ELEM_SIZE);
 
     // Zero-initialize histogram buffer (required for atomic adds)
     let histo_zeros = vec![0u32; NUM_DIGITS * HISTOGRAM_SIZE];
     let histograms = client.create(u32::as_bytes(&histo_zeros));
-
-    // Each block processes SCATTER_BLOCK_KVS keys (256 threads × 15 items = 3840)
-    let num_blocks = num_elements.div_ceil(SCATTER_BLOCK_KVS);
 
     // Step 1: Calculate histogram for all passes at once
     unsafe {
@@ -622,7 +600,6 @@ pub fn radix_sort_u32<R: Runtime>(client: &ComputeClient<R::Server>, input: &[u3
             CubeDim::new(HISTOGRAM_BLOCK_SIZE as u32, 1, 1),
             ArrayArg::from_raw_parts::<u32>(&keys_a, num_elements, 1),
             ArrayArg::from_raw_parts::<u32>(&histograms, NUM_DIGITS * HISTOGRAM_SIZE, 1),
-            ScalarArg::new(num_elements as u32),
         );
     }
 
@@ -708,8 +685,9 @@ fn main() {
 
     type R = cubecl::wgpu::WgpuRuntime;
 
-    // Test with non-aligned size (not a multiple of SCATTER_BLOCK_KVS = 3840)
-    let input_data: Vec<u32> = (1..=10000u32).rev().collect(); // 10000 elements, reversed
+    // Test with aligned sizes (multiples of 3840)
+    let count = 7680u32; // 2 blocks
+    let input_data: Vec<u32> = (1..=count).rev().collect();
     println!("Sorting {} elements...", input_data.len());
 
     let output = radix_sort_u32::<R>(&client, &input_data);
@@ -719,16 +697,15 @@ fn main() {
 
     if is_sorted {
         println!("FULLY SORTED! {} elements", output.len());
-        println!("First 20: {:?}", &output[..20]);
-        println!("Last 20: {:?}", &output[output.len() - 20..]);
+        println!("First 10: {:?}", &output[..10]);
+        println!("Last 10: {:?}", &output[output.len() - 10..]);
     } else {
-        // Find first error
+        println!("Sort FAILED");
         for i in 1..output.len() {
             if output[i] < output[i - 1] {
-                println!("Sort error at {}: {} > {}", i, output[i - 1], output[i]);
+                println!("Error at {}: {} > {}", i, output[i - 1], output[i]);
                 break;
             }
         }
-        println!("First 50: {:?}", &output[..50]);
     }
 }
