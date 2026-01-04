@@ -59,14 +59,14 @@ fn fill_kv(input_data: &Array<u32>, kv: &mut Array<u32>, num_elements: u32) {
 
     // Each thread will process TILE_SIZE elements
     for i in 0u32..comptime!(TILE_SIZE as u32) {
-        // Stride to allow memory coalescing
+        // Stride by CUBE_DIM (workgroup size) to allow memory coalescing
         //
         // [ x x x ....  x     | y y  .........  ]
         //   ^th0        ^th255  ^th0
         //     ^th1                ^th1
         //  <---- tile 0 -----> <--- tile 1 ---->
         //
-        let idx = tile_start_idx + i * TILE_SIZE_U32 + UNIT_POS;
+        let idx = tile_start_idx + i * CUBE_DIM + UNIT_POS;
         if idx < num_elements {
             kv[i] = input_data[idx];
         } else {
@@ -169,7 +169,6 @@ fn kernel_prefix_histogram(histograms: &mut Array<u32>, #[comptime] num_planes: 
 
 const STATUS_MASK: u32 = 0xC0000000u32; // top 2 bits
 const COUNT_MASK: u32 = 0x3FFFFFFFu32; // bottom 30 bits
-const STATUS_BITS: u32 = 30;
 
 #[cube]
 fn popcount(x: u32) -> u32 {
@@ -393,7 +392,7 @@ fn rank_to_local_index(
     pass: u32,
 ) {
     for j in 0..TILE_SIZE_U32 {
-        let digit = extract_digit(kv[j], pass);
+        let digit = extract_digit(pass, kv[j]);
         let local_prefix = Atomic::load(&histogram_smem[digit]); // where this digit starts in tile
         let rank = kr[j]; // block-global rank (1-indexed)
 
@@ -469,7 +468,7 @@ fn local_to_global_index(
 ) {
     #[unroll]
     for j in 0..TILE_SIZE_U32 {
-        let digit = extract_digit(kv[j], pass);
+        let digit = extract_digit(pass, kv[j]);
         let global_prefix = scatter_smem[digit];
         let rank = kr[j]; // 1-indexed
 
@@ -516,8 +515,8 @@ fn kernel_scatter(
     // Histogram: atomic during accumulation, becomes local prefix after step 5
     let histogram_smem = SharedMemory::<Atomic<u32>>::new(HISTOGRAM_SIZE_U32);
 
-    // Reorder buffer (step 7 only) - could alias histogram_smem if you're clever
-    let mut reorder_smem = SharedMemory::<u32>::new(TILE_SIZE_U32);
+    // Reorder buffer (step 7 only) - needs space for all keys in the tile
+    let mut reorder_smem = SharedMemory::<u32>::new(comptime!(SCATTER_BLOCK_KVS as u32));
 
     // Step 3: Accumulate local histogram
     accumulate_local_histogram(&kv, &mut kr, &histogram_smem, pass);
@@ -567,11 +566,15 @@ fn main() {
     const ELEM_SIZE: usize = std::mem::size_of::<u32>();
     let input_data_gpu = client.create(u32::as_bytes(&input_data));
     let output_data_gpu = client.empty(num_elements * ELEM_SIZE);
-    let histo_buffer = client.empty(NUM_DIGITS * HISTOGRAM_SIZE * ELEM_SIZE);
+
+    // Zero-initialize histogram buffer (required for atomic adds)
+    let histo_zeros = vec![0u32; NUM_DIGITS * HISTOGRAM_SIZE];
+    let histo_buffer = client.create(u32::as_bytes(&histo_zeros));
 
     let debug_buffer = client.empty(NUM_DIGITS * HISTOGRAM_SIZE * ELEM_SIZE);
 
-    let num_blocks = num_elements.div_ceil(HISTOGRAM_BLOCK_SIZE);
+    // Each block processes SCATTER_BLOCK_KVS keys (256 threads × 15 items = 3840)
+    let num_blocks = num_elements.div_ceil(SCATTER_BLOCK_KVS);
 
     unsafe {
         kernel_calc_histogram::launch::<R>(
@@ -596,7 +599,9 @@ fn main() {
     }
     println!("Calling scatter kernel");
 
-    let partition_buffer = client.empty(num_blocks * HISTOGRAM_SIZE * ELEM_SIZE);
+    // Zero-initialize partition buffer (required for lookback - 0 = INVALID for even passes)
+    let partition_zeros = vec![0u32; num_blocks * HISTOGRAM_SIZE];
+    let partition_buffer = client.create(u32::as_bytes(&partition_zeros));
     unsafe {
         kernel_scatter::launch::<R>(
             &client,
@@ -617,6 +622,24 @@ fn main() {
     let result = client.read_one(output_data_gpu.clone());
     let output = u32::from_bytes(&result).to_vec();
 
-    println!("Histo for pass 0: {:?}", &output[..256]);
-    // println!("Histo for pass 1: {:x?}", &output[256..512]);
+    // Verify pass 0 sorting: should be sorted by lower 8 bits
+    let mut is_sorted = true;
+    for i in 1..output.len() {
+        let prev_digit = output[i - 1] & 0xFF;
+        let curr_digit = output[i] & 0xFF;
+        if curr_digit < prev_digit {
+            println!("Sort error at {}: {} (digit {}) -> {} (digit {})",
+                     i, output[i-1], prev_digit, output[i], curr_digit);
+            is_sorted = false;
+            break;
+        }
+    }
+
+    if is_sorted {
+        println!("Pass 0 sort: CORRECT! {} elements sorted by lower 8 bits", output.len());
+        println!("First 30 values (digit 0): {:?}", &output[..30]);
+        println!("Next 30 values (digit 1): {:?}", &output[30..60]);
+    } else {
+        println!("First 256 values: {:?}", &output[..256]);
+    }
 }
