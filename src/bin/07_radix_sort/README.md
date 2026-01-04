@@ -26,9 +26,21 @@ The algorithm performs 4 passes (8 bits per pass for 32-bit keys):
 
 ## Limitations
 
-- Currently requires input size to be a multiple of 3840 (block size × tile size)
+- Currently requires input size to be a multiple of 3840 (SCATTER_BLOCK_SIZE × TILE_SIZE)
+- Limited to 2 blocks (7680 elements max) due to decoupled look-back scheduling issues
 - Keys-only sorting (no key-value pairs yet)
 - Tested with wgpu backend
+
+## Known Issues
+
+The decoupled look-back algorithm requires all GPU blocks to run concurrently. On some GPUs
+or with certain block counts, blocks may be scheduled out of order causing the spin-wait
+to hang. The original wgpu_sort implementation avoids this by:
+
+1. Using shared memory instead of subgroup ballot operations for rank calculation
+2. GPU-side padding in a separate kernel pass
+
+These optimizations are not yet implemented in this CubeCL version.
 
 ## Usage
 
