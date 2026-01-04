@@ -16,6 +16,7 @@ const SCATTER_BLOCK_KVS: usize = SCATTER_BLOCK_SIZE * TILE_SIZE;
 
 const HISTOGRAM_BLOCK_SIZE_U32: u32 = HISTOGRAM_BLOCK_SIZE as u32;
 
+use cubecl::client::ComputeClient;
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 
@@ -45,28 +46,35 @@ fn even_partition_mask_info<'a, R: Runtime>() -> PartitionMaskInfoLaunch<'a, R> 
 }
 
 fn odd_partition_mask_info<'a, R: Runtime>() -> PartitionMaskInfoLaunch<'a, R> {
+    // Odd's INVALID (0b10) equals Even's PREFIX, so odd passes see even's leftover as invalid
     PartitionMaskInfoLaunch::<R>::new(
-        ScalarArg::new(0b01 << 30), // mask_invalid = 0x40000000
+        ScalarArg::new(0b10 << 30), // mask_invalid = 0x80000000
         ScalarArg::new(0b11 << 30), // mask_reduction = 0xC0000000
         ScalarArg::new(0b00 << 30), // mask_prefix = 0x00000000
     )
 }
 
-// Copy keys from global memory to local memory (use coalesced access for tiles)
+// Copy keys from global memory to local memory
+// Uses subgroup-based loading for coalescing while maintaining stability
 #[cube]
 fn fill_kv(input_data: &Array<u32>, kv: &mut Array<u32>, num_elements: u32) {
-    let tile_start_idx: u32 = CUBE_POS * HISTOGRAM_BLOCK_SIZE_U32 * TILE_SIZE_U32;
+    let block_keyvals = CUBE_DIM * TILE_SIZE_U32;
+    let subgroup_keyvals = PLANE_DIM * TILE_SIZE_U32;
 
-    // Each thread will process TILE_SIZE elements
+    let subgroup_id = UNIT_POS / PLANE_DIM;
+    let subgroup_lane = UNIT_POS % PLANE_DIM;
+
+    // Each subgroup gets a contiguous block of subgroup_keyvals elements
+    // Within the subgroup, threads stride by PLANE_DIM for coalescing
+    //
+    // Memory layout per workgroup:
+    // [subgroup 0's data][subgroup 1's data][subgroup 2's data]...
+    // Within each subgroup block: stride by PLANE_DIM
+    //
+    let kv_in_offset = CUBE_POS * block_keyvals + subgroup_id * subgroup_keyvals + subgroup_lane;
+
     for i in 0u32..comptime!(TILE_SIZE as u32) {
-        // Stride by CUBE_DIM (workgroup size) to allow memory coalescing
-        //
-        // [ x x x ....  x     | y y  .........  ]
-        //   ^th0        ^th255  ^th0
-        //     ^th1                ^th1
-        //  <---- tile 0 -----> <--- tile 1 ---->
-        //
-        let idx = tile_start_idx + i * CUBE_DIM + UNIT_POS;
+        let idx = kv_in_offset + i * PLANE_DIM;
         if idx < num_elements {
             kv[i] = input_data[idx];
         } else {
@@ -414,7 +422,11 @@ fn reorder_in_shared_memory(
     kr: &mut Array<u32>,
     reorder_smem: &mut SharedMemory<u32>, // size = tile_size
 ) {
-    let lid = UNIT_POS_X;
+    // Gather pattern must match fill_kv's loading pattern (subgroup-based)
+    let subgroup_keyvals = PLANE_DIM * TILE_SIZE_U32;
+    let subgroup_id = UNIT_POS / PLANE_DIM;
+    let subgroup_lane = UNIT_POS % PLANE_DIM;
+    let base_idx = subgroup_id * subgroup_keyvals + subgroup_lane;
 
     // --- Scatter keys to sorted positions ---
     #[unroll]
@@ -425,10 +437,10 @@ fn reorder_in_shared_memory(
 
     sync_cube();
 
-    // --- Gather keys back in linear order ---
+    // --- Gather keys back in subgroup-strided order ---
     #[unroll]
     for j in 0..TILE_SIZE_U32 {
-        let smem_idx = lid + j * CUBE_DIM;
+        let smem_idx = base_idx + j * PLANE_DIM;
         kv[j] = reorder_smem[smem_idx];
     }
 
@@ -443,10 +455,10 @@ fn reorder_in_shared_memory(
 
     sync_cube();
 
-    // --- Gather kr back in linear order ---
+    // --- Gather kr back in subgroup-strided order ---
     #[unroll]
     for j in 0..TILE_SIZE_U32 {
-        let smem_idx = lid + j * CUBE_DIM;
+        let smem_idx = base_idx + j * PLANE_DIM;
         kr[j] = reorder_smem[smem_idx];
     }
 
@@ -494,7 +506,7 @@ fn kernel_scatter(
     partition_status: &mut Array<Atomic<u32>>,
     debug_buffer: &mut Array<u32>,
     partition_mask_info: &PartitionMaskInfo,
-    #[comptime] pass: u32,
+    pass: u32,  // Runtime parameter - changes per pass
     #[comptime] num_elements: u32,
     #[comptime] num_planes: u32,
 ) {
@@ -554,92 +566,176 @@ fn kernel_scatter(
     store_to_global(&kv, &kr, keys_out);
 }
 
+/// Run one scatter pass
+fn run_scatter_pass<R: Runtime>(
+    client: &ComputeClient<R::Server>,
+    keys_in: &Handle,
+    keys_out: &Handle,
+    histograms: &Handle,
+    partition_status: &Handle,
+    debug_buffer: &Handle,
+    pass: u32,
+    num_elements: usize,
+    num_blocks: usize,
+    num_planes: u32,
+) {
+    let partition_mask = if pass % 2 == 0 {
+        even_partition_mask_info::<R>()
+    } else {
+        odd_partition_mask_info::<R>()
+    };
+
+    unsafe {
+        kernel_scatter::launch::<R>(
+            client,
+            CubeCount::Static(num_blocks as u32, 1, 1),
+            CubeDim::new(SCATTER_BLOCK_SIZE as u32, 1, 1),
+            ArrayArg::from_raw_parts::<u32>(keys_in, num_elements, 1),
+            ArrayArg::from_raw_parts::<u32>(keys_out, num_elements, 1),
+            ArrayArg::from_raw_parts::<u32>(histograms, NUM_DIGITS * HISTOGRAM_SIZE, 1),
+            ArrayArg::from_raw_parts::<u32>(partition_status, num_blocks * HISTOGRAM_SIZE, 1),
+            ArrayArg::from_raw_parts::<u32>(debug_buffer, NUM_DIGITS * HISTOGRAM_SIZE, 1),
+            partition_mask,
+            ScalarArg::new(pass),
+            num_elements as u32,
+            num_planes,
+        );
+    }
+}
+
 fn main() {
     let device = Default::default();
     let client = cubecl::wgpu::WgpuRuntime::client(&device);
 
     type R = cubecl::wgpu::WgpuRuntime;
 
-    let input_data = (1..=(3840 * 2)).collect::<Vec<u32>>();
+    let input_data: Vec<u32> = (1..=(3840 * 2)).collect();
     let num_elements = input_data.len();
 
     const ELEM_SIZE: usize = std::mem::size_of::<u32>();
-    let input_data_gpu = client.create(u32::as_bytes(&input_data));
-    let output_data_gpu = client.empty(num_elements * ELEM_SIZE);
+
+    // Double-buffer for ping-pong between passes
+    // Pass 0: keys_a → keys_b (sort by bits 0-7)
+    // Pass 1: keys_b → keys_a (sort by bits 8-15)
+    // Pass 2: keys_a → keys_b (sort by bits 16-23)
+    // Pass 3: keys_b → keys_a (sort by bits 24-31)
+    // Final result in keys_a
+    let keys_a = client.create(u32::as_bytes(&input_data));
+    let keys_b = client.empty(num_elements * ELEM_SIZE);
 
     // Zero-initialize histogram buffer (required for atomic adds)
     let histo_zeros = vec![0u32; NUM_DIGITS * HISTOGRAM_SIZE];
-    let histo_buffer = client.create(u32::as_bytes(&histo_zeros));
+    let histograms = client.create(u32::as_bytes(&histo_zeros));
 
     let debug_buffer = client.empty(NUM_DIGITS * HISTOGRAM_SIZE * ELEM_SIZE);
 
     // Each block processes SCATTER_BLOCK_KVS keys (256 threads × 15 items = 3840)
     let num_blocks = num_elements.div_ceil(SCATTER_BLOCK_KVS);
 
+    // Step 1: Calculate histogram for all passes at once
     unsafe {
         kernel_calc_histogram::launch::<R>(
             &client,
             CubeCount::Static(num_blocks as u32, 1, 1),
             CubeDim::new(HISTOGRAM_BLOCK_SIZE as u32, 1, 1),
-            ArrayArg::from_raw_parts::<u32>(&input_data_gpu, num_elements, 1),
-            ArrayArg::from_raw_parts::<u32>(&histo_buffer, NUM_DIGITS * HISTOGRAM_SIZE, 1),
+            ArrayArg::from_raw_parts::<u32>(&keys_a, num_elements, 1),
+            ArrayArg::from_raw_parts::<u32>(&histograms, NUM_DIGITS * HISTOGRAM_SIZE, 1),
             ScalarArg::new(num_elements as u32),
         );
     }
 
+    // Step 2: Prefix sum each pass's histogram
     let num_planes = PREFIX_BLOCK_SIZE as u32 / PLANE_DIM;
     unsafe {
         kernel_prefix_histogram::launch::<R>(
             &client,
             CubeCount::Static(1, 1, 1),
             CubeDim::new(PREFIX_BLOCK_SIZE as u32, 1, 1),
-            ArrayArg::from_raw_parts::<u32>(&histo_buffer, NUM_DIGITS * HISTOGRAM_SIZE, 1),
+            ArrayArg::from_raw_parts::<u32>(&histograms, NUM_DIGITS * HISTOGRAM_SIZE, 1),
             num_planes,
         );
     }
-    println!("Calling scatter kernel");
 
-    // Zero-initialize partition buffer (required for lookback - 0 = INVALID for even passes)
+    // Zero-initialize partition buffer (required for lookback)
+    // Even passes see 0 as INVALID, odd passes see 0x80000000 as INVALID
+    // The alternating mask trick means we don't need to re-zero between passes
     let partition_zeros = vec![0u32; num_blocks * HISTOGRAM_SIZE];
-    let partition_buffer = client.create(u32::as_bytes(&partition_zeros));
-    unsafe {
-        kernel_scatter::launch::<R>(
-            &client,
-            CubeCount::Static(num_blocks as u32, 1, 1),
-            CubeDim::new(SCATTER_BLOCK_SIZE as u32, 1, 1),
-            ArrayArg::from_raw_parts::<u32>(&input_data_gpu, num_elements, 1),
-            ArrayArg::from_raw_parts::<u32>(&output_data_gpu, num_elements, 1),
-            ArrayArg::from_raw_parts::<u32>(&histo_buffer, NUM_DIGITS * HISTOGRAM_SIZE, 1),
-            ArrayArg::from_raw_parts::<u32>(&partition_buffer, num_blocks * HISTOGRAM_SIZE, 1),
-            ArrayArg::from_raw_parts::<u32>(&debug_buffer, NUM_DIGITS * HISTOGRAM_SIZE, 1),
-            even_partition_mask_info::<R>(),
-            0u32,
-            num_elements as u32,
-            num_planes,
-        );
-    }
+    let partition_status = client.create(u32::as_bytes(&partition_zeros));
 
-    let result = client.read_one(output_data_gpu.clone());
+    println!("Running 4 scatter passes...");
+
+    // Helper to verify sorting by specific bits
+    let verify_pass = |data: &[u32], pass: u32, label: &str| {
+        let shift = pass * 8;
+        let mut ok = true;
+        for i in 1..data.len() {
+            let prev_digit = (data[i-1] >> shift) & 0xFF;
+            let curr_digit = (data[i] >> shift) & 0xFF;
+            if curr_digit < prev_digit {
+                println!("{}: FAIL at {}: {} (digit {}) > {} (digit {})",
+                    label, i, data[i-1], prev_digit, data[i], curr_digit);
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            println!("{}: OK - first 10: {:?}", label, &data[..10]);
+        }
+    };
+
+    // Step 3: Run all 4 scatter passes
+    // Pass 0 (even): keys_a → keys_b
+    run_scatter_pass::<R>(
+        &client, &keys_a, &keys_b, &histograms, &partition_status, &debug_buffer,
+        0, num_elements, num_blocks, num_planes,
+    );
+    let result = client.read_one(keys_b.clone());
+    let data = u32::from_bytes(&result).to_vec();
+    verify_pass(&data, 0, "Pass 0");
+
+    // Pass 1 (odd): keys_b → keys_a
+    run_scatter_pass::<R>(
+        &client, &keys_b, &keys_a, &histograms, &partition_status, &debug_buffer,
+        1, num_elements, num_blocks, num_planes,
+    );
+    let result = client.read_one(keys_a.clone());
+    let data = u32::from_bytes(&result).to_vec();
+    verify_pass(&data, 1, "Pass 1");
+
+    // Pass 2 (even): keys_a → keys_b
+    run_scatter_pass::<R>(
+        &client, &keys_a, &keys_b, &histograms, &partition_status, &debug_buffer,
+        2, num_elements, num_blocks, num_planes,
+    );
+    let result = client.read_one(keys_b.clone());
+    let data = u32::from_bytes(&result).to_vec();
+    verify_pass(&data, 2, "Pass 2");
+
+    // Pass 3 (odd): keys_b → keys_a
+    run_scatter_pass::<R>(
+        &client, &keys_b, &keys_a, &histograms, &partition_status, &debug_buffer,
+        3, num_elements, num_blocks, num_planes,
+    );
+
+    // Final result is in keys_a
+    let result = client.read_one(keys_a.clone());
     let output = u32::from_bytes(&result).to_vec();
 
-    // Verify pass 0 sorting: should be sorted by lower 8 bits
-    let mut is_sorted = true;
-    for i in 1..output.len() {
-        let prev_digit = output[i - 1] & 0xFF;
-        let curr_digit = output[i] & 0xFF;
-        if curr_digit < prev_digit {
-            println!("Sort error at {}: {} (digit {}) -> {} (digit {})",
-                     i, output[i-1], prev_digit, output[i], curr_digit);
-            is_sorted = false;
-            break;
-        }
-    }
+    // Verify full sort
+    let is_sorted = output.windows(2).all(|w| w[0] <= w[1]);
 
     if is_sorted {
-        println!("Pass 0 sort: CORRECT! {} elements sorted by lower 8 bits", output.len());
-        println!("First 30 values (digit 0): {:?}", &output[..30]);
-        println!("Next 30 values (digit 1): {:?}", &output[30..60]);
+        println!("FULLY SORTED! {} elements", output.len());
+        println!("First 20: {:?}", &output[..20]);
+        println!("Last 20: {:?}", &output[output.len()-20..]);
     } else {
-        println!("First 256 values: {:?}", &output[..256]);
+        // Find first error
+        for i in 1..output.len() {
+            if output[i] < output[i-1] {
+                println!("Sort error at {}: {} > {}", i, output[i-1], output[i]);
+                break;
+            }
+        }
+        println!("First 50: {:?}", &output[..50]);
     }
 }
