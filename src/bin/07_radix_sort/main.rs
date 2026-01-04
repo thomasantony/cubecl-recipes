@@ -610,21 +610,32 @@ fn run_scatter_pass<R: Runtime>(
 
 /// Sort u32 values using GPU radix sort.
 /// Returns the sorted data.
-/// Note: Input size must be a multiple of SCATTER_BLOCK_KVS (3840) for now.
 pub fn radix_sort_u32<R: Runtime>(client: &ComputeClient<R::Server>, input: &[u32]) -> Vec<u32> {
-    let num_elements = input.len();
-    if num_elements == 0 {
+    let original_len = input.len();
+    if original_len == 0 {
         return vec![];
     }
 
     const ELEM_SIZE: usize = std::mem::size_of::<u32>();
 
     // Each block processes SCATTER_BLOCK_KVS keys (256 threads × 15 items = 3840)
-    let num_blocks = num_elements.div_ceil(SCATTER_BLOCK_KVS);
+    // Pad input to next multiple of SCATTER_BLOCK_KVS
+    let padded_size = original_len.next_multiple_of(SCATTER_BLOCK_KVS);
+    let num_blocks = padded_size / SCATTER_BLOCK_KVS;
+
+    // Create padded input - use 0xFFFFFFFF for padding (sorts to end)
+    let padded_input: Vec<u32> = if padded_size == original_len {
+        input.to_vec()
+    } else {
+        let mut padded = Vec::with_capacity(padded_size);
+        padded.extend_from_slice(input);
+        padded.resize(padded_size, 0xFFFFFFFF);
+        padded
+    };
 
     // Double-buffer for ping-pong between passes
-    let keys_a = client.create(u32::as_bytes(input));
-    let keys_b = client.empty(num_elements * ELEM_SIZE);
+    let keys_a = client.create(u32::as_bytes(&padded_input));
+    let keys_b = client.empty(padded_size * ELEM_SIZE);
 
     // Zero-initialize histogram buffer (required for atomic adds)
     let histo_zeros = vec![0u32; NUM_DIGITS * HISTOGRAM_SIZE];
@@ -636,7 +647,7 @@ pub fn radix_sort_u32<R: Runtime>(client: &ComputeClient<R::Server>, input: &[u3
             client,
             CubeCount::Static(num_blocks as u32, 1, 1),
             CubeDim::new(HISTOGRAM_BLOCK_SIZE as u32, 1, 1),
-            ArrayArg::from_raw_parts::<u32>(&keys_a, num_elements, 1),
+            ArrayArg::from_raw_parts::<u32>(&keys_a, padded_size, 1),
             ArrayArg::from_raw_parts::<u32>(&histograms, NUM_DIGITS * HISTOGRAM_SIZE, 1),
         );
     }
@@ -668,14 +679,10 @@ pub fn radix_sort_u32<R: Runtime>(client: &ComputeClient<R::Server>, input: &[u3
         &histograms,
         &partition_status,
         0,
-        num_elements,
+        padded_size,
         num_blocks,
         num_planes,
     );
-
-    let result = client.read_one(keys_b.clone());
-    let foo = u32::from_bytes(&result).to_vec();
-    println!("keys_b: {:?}", &foo[..16]);
 
     // Pass 1 (odd): keys_b → keys_a
     run_scatter_pass::<R>(
@@ -685,14 +692,10 @@ pub fn radix_sort_u32<R: Runtime>(client: &ComputeClient<R::Server>, input: &[u3
         &histograms,
         &partition_status,
         1,
-        num_elements,
+        padded_size,
         num_blocks,
         num_planes,
     );
-
-    let result = client.read_one(keys_a.clone());
-    let foo = u32::from_bytes(&result).to_vec();
-    println!("keys_a: {:?}", &foo[..16]);
 
     // Pass 2 (even): keys_a → keys_b
     run_scatter_pass::<R>(
@@ -702,13 +705,10 @@ pub fn radix_sort_u32<R: Runtime>(client: &ComputeClient<R::Server>, input: &[u3
         &histograms,
         &partition_status,
         2,
-        num_elements,
+        padded_size,
         num_blocks,
         num_planes,
     );
-    let result = client.read_one(keys_b.clone());
-    let foo = u32::from_bytes(&result).to_vec();
-    println!("keys_b: {:?}", &foo[..16]);
 
     // Pass 3 (odd): keys_b → keys_a
     run_scatter_pass::<R>(
@@ -718,17 +718,16 @@ pub fn radix_sort_u32<R: Runtime>(client: &ComputeClient<R::Server>, input: &[u3
         &histograms,
         &partition_status,
         3,
-        num_elements,
+        padded_size,
         num_blocks,
         num_planes,
     );
-    let result = client.read_one(keys_a.clone());
-    let foo = u32::from_bytes(&result).to_vec();
-    println!("keys_a: {:?}", &foo[..16]);
 
-    // Final result is in keys_a
+    // Final result is in keys_a - truncate to original length
+    // (padding values 0xFFFFFFFF sort to the end)
     let result = client.read_one(keys_a.clone());
-    u32::from_bytes(&result).to_vec()
+    let sorted = u32::from_bytes(&result);
+    sorted[..original_len].to_vec()
 }
 
 fn main() {
@@ -737,14 +736,25 @@ fn main() {
 
     type R = cubecl::wgpu::WgpuRuntime;
 
-    // Test with aligned sizes (multiples of 3840)
-    let count = 7680u32; // 2 blocks
+    // Test with non-aligned size to verify padding works
+    let count = 50000u32; // Not a multiple of 3840
     let input_data: Vec<u32> = (1..=count).rev().collect();
-    println!("Sorting {} elements...", input_data.len());
+    println!(
+        "Sorting {} elements (padded to {})...",
+        input_data.len(),
+        input_data.len().next_multiple_of(SCATTER_BLOCK_KVS)
+    );
 
     let output = radix_sort_u32::<R>(&client, &input_data);
 
-    // Verify
+    // Verify length matches original (padding should be excluded)
+    assert_eq!(
+        output.len(),
+        input_data.len(),
+        "Output length should match input length"
+    );
+
+    // Verify sorted
     let is_sorted = output.windows(2).all(|w| w[0] <= w[1]);
 
     if is_sorted {
