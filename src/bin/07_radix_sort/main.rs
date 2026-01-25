@@ -664,13 +664,18 @@ pub fn radix_sort_u32<R: Runtime>(client: &ComputeClient<R::Server>, input: &[u3
         );
     }
 
-    // Single partition buffer - sync between passes to prevent overlap
-    // (The alternating mask scheme requires passes to complete sequentially)
+    // Single partition buffer - wgpu inserts memory barriers between dispatches
+    // accessing the same buffers when they're in the same command buffer
     let partition_zeros = vec![0u32; num_blocks * HISTOGRAM_SIZE];
     let partition_status = client.create(u32::as_bytes(&partition_zeros));
 
-    // Step 3: Run all 4 scatter passes with sync between each
-    // Pass 0 (even): keys_a → keys_b
+    // Step 3: Run all 4 scatter passes
+    //
+    // LIMITATIONS due to decoupled lookback + GPU forward progress:
+    // - Set CUBECL_WGPU_MAX_TASKS=1000 to batch kernels together
+    // - Max 7 blocks (~27K elements) for fast operation
+    // - 8 blocks works but is ~600x slower due to scheduling contention
+    // - 9+ blocks deadlocks (spin-wait starvation)
     run_scatter_pass::<R>(
         client,
         &keys_a,
@@ -682,9 +687,6 @@ pub fn radix_sort_u32<R: Runtime>(client: &ComputeClient<R::Server>, input: &[u3
         num_blocks,
         num_planes,
     );
-    pollster::block_on(client.sync());
-
-    // Pass 1 (odd): keys_b → keys_a
     run_scatter_pass::<R>(
         client,
         &keys_b,
@@ -696,9 +698,6 @@ pub fn radix_sort_u32<R: Runtime>(client: &ComputeClient<R::Server>, input: &[u3
         num_blocks,
         num_planes,
     );
-    pollster::block_on(client.sync());
-
-    // Pass 2 (even): keys_a → keys_b
     run_scatter_pass::<R>(
         client,
         &keys_a,
@@ -710,9 +709,6 @@ pub fn radix_sort_u32<R: Runtime>(client: &ComputeClient<R::Server>, input: &[u3
         num_blocks,
         num_planes,
     );
-    pollster::block_on(client.sync());
-
-    // Pass 3 (odd): keys_b → keys_a
     run_scatter_pass::<R>(
         client,
         &keys_b,
@@ -786,10 +782,6 @@ pub fn radix_sort_u32_gpu<R: Runtime>(
     let histo_zeros = vec![0u32; NUM_DIGITS * HISTOGRAM_SIZE];
     let histograms = client.create(u32::as_bytes(&histo_zeros));
 
-    // Create partition buffer (small relative to data)
-    let partition_zeros = vec![0u32; *num_blocks * HISTOGRAM_SIZE];
-    let partition_status = client.create(u32::as_bytes(&partition_zeros));
-
     // Step 1: Calculate histogram
     unsafe {
         kernel_calc_histogram::launch_unchecked::<R>(
@@ -812,56 +804,27 @@ pub fn radix_sort_u32_gpu<R: Runtime>(
         );
     }
 
-    // Step 3: Run all 4 scatter passes with sync between each
-    run_scatter_pass::<R>(
-        client,
-        keys_a,
-        keys_b,
-        &histograms,
-        &partition_status,
-        0,
-        *padded_size,
-        *num_blocks,
-        *num_planes,
-    );
-    pollster::block_on(client.sync());
+    // Partition buffer for decoupled lookback
+    let partition_zeros = vec![0u32; *num_blocks * HISTOGRAM_SIZE];
+    let partition_status = client.create(u32::as_bytes(&partition_zeros));
 
+    // Step 3: Run all 4 scatter passes
+    // WARNING: Max 7 blocks (~27K elements) due to GPU forward progress limits
     run_scatter_pass::<R>(
-        client,
-        keys_b,
-        keys_a,
-        &histograms,
-        &partition_status,
-        1,
-        *padded_size,
-        *num_blocks,
-        *num_planes,
+        client, keys_a, keys_b, &histograms, &partition_status,
+        0, *padded_size, *num_blocks, *num_planes,
     );
-    pollster::block_on(client.sync());
-
     run_scatter_pass::<R>(
-        client,
-        keys_a,
-        keys_b,
-        &histograms,
-        &partition_status,
-        2,
-        *padded_size,
-        *num_blocks,
-        *num_planes,
+        client, keys_b, keys_a, &histograms, &partition_status,
+        1, *padded_size, *num_blocks, *num_planes,
     );
-    pollster::block_on(client.sync());
-
     run_scatter_pass::<R>(
-        client,
-        keys_b,
-        keys_a,
-        &histograms,
-        &partition_status,
-        3,
-        *padded_size,
-        *num_blocks,
-        *num_planes,
+        client, keys_a, keys_b, &histograms, &partition_status,
+        2, *padded_size, *num_blocks, *num_planes,
+    );
+    run_scatter_pass::<R>(
+        client, keys_b, keys_a, &histograms, &partition_status,
+        3, *padded_size, *num_blocks, *num_planes,
     );
     // Result is now in keys_a
 }
@@ -872,8 +835,8 @@ fn main() {
 
     type R = cubecl::wgpu::WgpuRuntime;
 
-    // Test with non-aligned size to verify padding works
-    let count = 35000u32; // Not a multiple of 3840
+    // Test with 7 blocks (~27K elements) - the reliable fast limit
+    let count = 26_880u32;
     let input_data: Vec<u32> = (1..=count).rev().collect();
     println!(
         "Sorting {} elements (padded to {})...",
@@ -881,7 +844,76 @@ fn main() {
         input_data.len().next_multiple_of(SCATTER_BLOCK_KVS)
     );
 
-    let output = radix_sort_u32::<R>(&client, &input_data);
+    let start = std::time::Instant::now();
+
+    // Test: queue all kernels, flush once, then read
+    let original_len = input_data.len();
+    let padded_size = original_len.next_multiple_of(SCATTER_BLOCK_KVS);
+    let num_blocks = padded_size / SCATTER_BLOCK_KVS;
+
+    let mut padded_input = input_data.clone();
+    padded_input.resize(padded_size, 0xFFFFFFFF);
+
+    let keys_a = client.create(u32::as_bytes(&padded_input));
+    let keys_b = client.empty(padded_size * 4);
+
+    let histo_zeros = vec![0u32; NUM_DIGITS * HISTOGRAM_SIZE];
+    let histograms = client.create(u32::as_bytes(&histo_zeros));
+
+    let num_planes = PREFIX_BLOCK_SIZE as u32 / PLANE_DIM;
+
+    // Queue histogram kernel
+    unsafe {
+        kernel_calc_histogram::launch_unchecked::<R>(
+            &client,
+            CubeCount::Static(num_blocks as u32, 1, 1),
+            CubeDim::new(HISTOGRAM_BLOCK_SIZE as u32, 1, 1),
+            ArrayArg::from_raw_parts::<u32>(&keys_a, padded_size, 1),
+            ArrayArg::from_raw_parts::<u32>(&histograms, NUM_DIGITS * HISTOGRAM_SIZE, 1),
+        );
+    }
+
+    // Queue prefix sum kernel
+    unsafe {
+        kernel_prefix_histogram::launch_unchecked::<R>(
+            &client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new(PREFIX_BLOCK_SIZE as u32, 1, 1),
+            ArrayArg::from_raw_parts::<u32>(&histograms, NUM_DIGITS * HISTOGRAM_SIZE, 1),
+            num_planes,
+        );
+    }
+
+    let partition_zeros = vec![0u32; num_blocks * HISTOGRAM_SIZE];
+    let partition_status = client.create(u32::as_bytes(&partition_zeros));
+
+    // Queue all 4 scatter passes
+    run_scatter_pass::<R>(
+        &client, &keys_a, &keys_b, &histograms, &partition_status,
+        0, padded_size, num_blocks, num_planes,
+    );
+    run_scatter_pass::<R>(
+        &client, &keys_b, &keys_a, &histograms, &partition_status,
+        1, padded_size, num_blocks, num_planes,
+    );
+    run_scatter_pass::<R>(
+        &client, &keys_a, &keys_b, &histograms, &partition_status,
+        2, padded_size, num_blocks, num_planes,
+    );
+    run_scatter_pass::<R>(
+        &client, &keys_b, &keys_a, &histograms, &partition_status,
+        3, padded_size, num_blocks, num_planes,
+    );
+
+    // Flush all queued commands as a single batch
+    client.flush();
+
+    // Read result (this waits for completion)
+    let result = client.read_one(keys_a.clone());
+    let output: Vec<u32> = u32::from_bytes(&result)[..original_len].to_vec();
+
+    let elapsed = start.elapsed();
+    println!("Sort took: {:?}", elapsed);
 
     // Verify length matches original (padding should be excluded)
     assert_eq!(

@@ -5,6 +5,9 @@ edition = "2024"
 
 [dependencies]
 cubecl = { version = "0.8.1", features = ["wgpu"] }
+wgpu_sort = { path = "../wgpu_sort" }
+wgpu = "0.20"
+pollster = { version = "0.3.0", features = ["macro"] }
 
 [dev-dependencies]
 cubecl = { version = "0.8.1", features = ["wgpu"] }
@@ -28,3 +31,23 @@ path = "src/bin/03_plane_broadcast/main.rs"
 [[bin]]
 name = "04_block_sum"
 path = "src/bin/04_block_sum/main.rs"
+
+[[bin]]
+name = "05_hierarchical_scan"
+path = "src/bin/05_hierarchical_scan/main.rs"
+
+[[bin]]
+name = "06_plane_ballot"
+path = "src/bin/06_plane_ballot/main.rs"
+
+[[bin]]
+name = "07_radix_sort"
+path = "src/bin/07_radix_sort/main.rs"
+
+[[bin]]
+name = "benchmark_sort"
+path = "src/bin/benchmark_sort/main.rs"
+
+[[bench]]
+name = "sort"
+harness = false
