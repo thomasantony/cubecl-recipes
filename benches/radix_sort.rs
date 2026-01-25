@@ -1,0 +1,831 @@
+// GPU Radix Sort using CubeCL
+// Based on wgpu_sort / Fuchsia implementation with decoupled look-back
+
+const TILE_SIZE: usize = 15;
+const TILE_SIZE_U32: u32 = TILE_SIZE as u32;
+
+const BITS_PER_PASS: u32 = 8;
+const NUM_DIGITS: usize = 32 / (BITS_PER_PASS as usize);
+const HISTOGRAM_SIZE: usize = 1 << BITS_PER_PASS;
+const HISTOGRAM_SIZE_U32: u32 = HISTOGRAM_SIZE as u32;
+
+const HISTOGRAM_BLOCK_SIZE: usize = 256;
+pub const PREFIX_BLOCK_SIZE: usize = HISTOGRAM_SIZE;
+const SCATTER_BLOCK_SIZE: usize = 256;
+pub const SCATTER_BLOCK_KVS: usize = SCATTER_BLOCK_SIZE * TILE_SIZE;
+
+use cubecl::client::ComputeClient;
+use cubecl::prelude::*;
+use cubecl::server::Handle;
+
+#[cube]
+fn extract_digit(pass: u32, value: u32) -> u32 {
+    (value >> (pass * BITS_PER_PASS)) & ((1u32 << BITS_PER_PASS) - 1u32)
+}
+
+#[derive(CubeType, CubeLaunch)]
+struct PartitionMaskInfo {
+    pub mask_invalid: u32,
+    pub mask_reduction: u32,
+    pub mask_prefix: u32,
+}
+
+// Status bits occupy top 2 bits (30-31)
+// Even pass: after writing, bits are 0b00, 0b01, or 0b10
+// Odd pass:  after writing, bits are 0b10, 0b11, or 0b00
+// This way odd pass sees even's PREFIX (0b10) as INVALID, no zeroing needed
+
+fn even_partition_mask_info<'a, R: Runtime>() -> PartitionMaskInfoLaunch<'a, R> {
+    PartitionMaskInfoLaunch::<R>::new(
+        ScalarArg::new(0b00 << 30), // mask_invalid = 0x00000000
+        ScalarArg::new(0b01 << 30), // mask_reduction = 0x40000000
+        ScalarArg::new(0b10 << 30), // mask_prefix = 0x80000000
+    )
+}
+
+fn odd_partition_mask_info<'a, R: Runtime>() -> PartitionMaskInfoLaunch<'a, R> {
+    // Odd's INVALID (0b10) equals Even's PREFIX, so odd passes see even's leftover as invalid
+    PartitionMaskInfoLaunch::<R>::new(
+        ScalarArg::new(0b10 << 30), // mask_invalid = 0x80000000
+        ScalarArg::new(0b11 << 30), // mask_reduction = 0xC0000000
+        ScalarArg::new(0b00 << 30), // mask_prefix = 0x00000000
+    )
+}
+
+// Copy keys from global memory to local memory
+// Uses plane-based loading for coalescing while maintaining stability
+#[cube]
+fn fill_kv(input_data: &Array<u32>, kv: &mut Array<u32>) {
+    // RS_HISTOGRAM_BLOCK_ROWS = 15 // items per thread
+    // wg_size = CUBE_DIM
+    // let rs_block_keyvals: u32 = rs_histogram_block_rows * histogram_wg_size;
+    // let kv_in_offset = wid * rs_block_keyvals + lid;
+    // for (var i = 0u; i < rs_histogram_block_rows; i++) {
+    //     let pos = kv_in_offset + i * histogram_wg_size;
+    //     kv[i] = keys[pos];
+    // }
+
+    let block_keyvals = CUBE_DIM * TILE_SIZE_U32;
+
+    // Each plane gets a contiguous block of plane_keyvals elements
+    // Within the plane, threads stride by PLANE_DIM for coalescing
+    let kv_in_offset = CUBE_POS * block_keyvals + UNIT_POS;
+
+    for i in 0u32..comptime!(TILE_SIZE as u32) {
+        let pos = kv_in_offset + i * CUBE_DIM;
+        kv[i] = input_data[pos];
+    }
+}
+
+#[cube]
+fn fill_kv_scatter(keys: &Array<u32>, kv: &mut Array<u32>) {
+    // histogram_sg_size = PLANE_DIM
+    // rs_histogram_block_rows = TILE_SIZE_U32
+    // fn fill_kv_even(wid: u32, lid: u32) {
+    //     let subgroup_id = lid / histogram_sg_size;
+    //     let subgroup_invoc_id = lid - subgroup_id * histogram_sg_size;
+    //     let subgroup_keyvals = rs_scatter_block_rows * histogram_sg_size;
+    //     let rs_block_keyvals: u32 = rs_histogram_block_rows * histogram_wg_size;
+    //     let kv_in_offset = wid * rs_block_keyvals + subgroup_id * subgroup_keyvals + subgroup_invoc_id;
+    //     for (var i = 0u; i < rs_histogram_block_rows; i++) {
+    //         let pos = kv_in_offset + i * histogram_sg_size;
+    //         kv[i] = keys[pos];
+    //     }
+    //     for (var i = 0u; i < rs_histogram_block_rows; i++) {
+    //         let pos = kv_in_offset + i * histogram_sg_size;
+    //         pv[i] = payload_a[pos];
+    //     }
+    // }
+
+    let plane_id = UNIT_POS / PLANE_DIM;
+    let plane_invoc_id = UNIT_POS - plane_id * PLANE_DIM;
+    let plane_keyvals = TILE_SIZE_U32 * PLANE_DIM;
+    let rs_block_keyvals: u32 = TILE_SIZE_U32 * CUBE_DIM;
+    let kv_in_offset = CUBE_POS * rs_block_keyvals + plane_id * plane_keyvals + plane_invoc_id;
+
+    for i in 0u32..TILE_SIZE_U32 {
+        let pos = kv_in_offset + i * PLANE_DIM;
+        kv[i] = keys[pos];
+    }
+}
+
+#[cube]
+fn histogram_pass(
+    pass: u32,
+    kv: &Array<u32>,
+    smem_histogram: &SharedMemory<Atomic<u32>>,
+    histograms: &Array<Atomic<u32>>,
+) {
+    // zero the memory first
+    if UNIT_POS < comptime!(HISTOGRAM_SIZE_U32) {
+        Atomic::store(&smem_histogram[UNIT_POS], 0u32);
+    }
+    sync_cube();
+
+    // Use shared memory to accumulate histogram for current "tile"
+    for j in 0..TILE_SIZE_U32 {
+        let digit = extract_digit(pass, kv[j]);
+        Atomic::add(&smem_histogram[digit], 1u32);
+    }
+
+    sync_cube();
+
+    // Flush shared → global (one bin per thread)
+    if UNIT_POS < HISTOGRAM_SIZE_U32 {
+        Atomic::add(
+            &histograms[HISTOGRAM_SIZE_U32 * pass + UNIT_POS],
+            Atomic::load(&smem_histogram[UNIT_POS]),
+        );
+    }
+}
+
+#[cube(launch_unchecked)]
+fn kernel_calc_histogram(input_data: &Array<u32>, histograms: &mut Array<Atomic<u32>>) {
+    // Allocate registers/local memory for the current "tile" of keys
+    let mut kv = Array::<u32>::new(comptime!(TILE_SIZE as u32));
+
+    fill_kv(input_data, &mut kv);
+
+    let smem: SharedMemory<Atomic<u32>> = SharedMemory::<Atomic<u32>>::new(HISTOGRAM_SIZE_U32);
+
+    histogram_pass(3u32, &kv, &smem, &histograms);
+    histogram_pass(2u32, &kv, &smem, &histograms);
+    histogram_pass(1u32, &kv, &smem, &histograms);
+    histogram_pass(0u32, &kv, &smem, &histograms);
+}
+
+#[cube]
+fn prefix_histogram_pass(pass: u32, histograms: &mut Array<u32>, #[comptime] num_planes: u32) {
+    let plane_idx = UNIT_POS / PLANE_DIM;
+
+    let digit_idx = HISTOGRAM_SIZE_U32 * pass + ABSOLUTE_POS;
+    // Define shared memory for inter-plane communication
+    // Size is determined at kernel compile time via comptime parameter
+    let mut shared_totals = SharedMemory::<u32>::new(num_planes);
+
+    // 1. Local scan within plane
+    let original = histograms[digit_idx];
+    let local_scan = plane_exclusive_sum(original);
+
+    // 2. Plane totals -> shared memory
+    let plane_total =
+        plane_shuffle(local_scan, PLANE_DIM - 1) + plane_shuffle(original, PLANE_DIM - 1);
+    if UNIT_POS_PLANE == 0 {
+        shared_totals[plane_idx] = plane_total;
+    }
+    sync_cube();
+
+    // 3. Scan totals (single plane or serial)
+    if plane_idx == 0 && UNIT_POS_PLANE < num_planes {
+        let offset = plane_exclusive_sum(shared_totals[UNIT_POS_PLANE]);
+        shared_totals[UNIT_POS_PLANE] = offset;
+    }
+    sync_cube();
+
+    // 4. Apply offset from previous planes
+    let result = local_scan + shared_totals[plane_idx];
+
+    histograms[digit_idx] = result;
+}
+
+// Assume prefix_histogram is launched with 256-thread blocks
+#[cube(launch_unchecked)]
+fn kernel_prefix_histogram(histograms: &mut Array<u32>, #[comptime] num_planes: u32) {
+    prefix_histogram_pass(0u32, histograms, num_planes);
+    prefix_histogram_pass(1u32, histograms, num_planes);
+    prefix_histogram_pass(2u32, histograms, num_planes);
+    prefix_histogram_pass(3u32, histograms, num_planes);
+}
+
+const STATUS_MASK: u32 = 0xC0000000u32; // top 2 bits
+const COUNT_MASK: u32 = 0x3FFFFFFFu32; // bottom 30 bits
+
+#[cube]
+fn compute_local_count_and_rank(kv: &Array<u32>, kr: &mut Array<u32>, pass: u32) {
+    let lane_mask_lt = Line::new((1u32 << UNIT_POS_PLANE) - 1u32);
+
+    for j in 0..TILE_SIZE_U32 {
+        let digit = extract_digit(pass, kv[j]);
+
+        // Build match_mask: bit j is set iff lane j has same digit as me
+
+        let mut match_mask = Line::<u32>::new(0xFFFFFFFFu32);
+        // Unrolled for 8-bit digit
+        for bit in 0u32..8u32 {
+            let my_bit = (digit >> bit) & 1u32;
+            let predicate = my_bit == 1u32;
+            let ballot = plane_ballot(predicate);
+            let mask_for_bit = Line::new(ballot[0] ^ (0u32 - (1u32 - my_bit)));
+            match_mask = match_mask & mask_for_bit;
+        }
+
+        // count = total lanes with same digit
+        let count = match_mask.count_ones()[0];
+
+        // rank = how many matching lanes have lower lane_id than me, plus 1
+        // (1-indexed to match the WGSL implementation)
+        match_mask = match_mask & lane_mask_lt;
+        let rank = match_mask.count_ones()[0] + 1;
+
+        kr[j] = (count << 16) | rank;
+    }
+}
+
+#[cube]
+fn accumulate_local_histogram(
+    kv: &Array<u32>,
+    kr: &mut Array<u32>,
+    smem: &SharedMemory<Atomic<u32>>,
+    pass: u32,
+) {
+    // First zero it out
+    if UNIT_POS < HISTOGRAM_SIZE_U32 {
+        Atomic::store(&smem[UNIT_POS], 0u32);
+    }
+
+    sync_cube();
+
+    let plane_id = UNIT_POS / PLANE_DIM;
+    let num_planes = CUBE_DIM / PLANE_DIM;
+
+    // Sequential - each "plane" waits for the previous one to finish (hence the sync_cube())
+    for i in 0..num_planes {
+        if plane_id == i {
+            for j in 0..TILE_SIZE_U32 {
+                let digit = extract_digit(pass, kv[j]);
+                let prev = Atomic::load(&smem[digit]);
+
+                // Separate out rank and count from kr[j]
+                let rank = kr[j] & 0xFFFF;
+                let count = kr[j] >> 16;
+                // Update kr to block-global rank
+                kr[j] = prev + rank;
+
+                // The rank will equal count in the last thread with this digit (since we used 1-based rank)
+                // Only the last thread with this digit updates histogram
+                //
+                if rank == count {
+                    Atomic::store(&smem[digit], prev + count);
+                }
+            }
+        }
+        sync_cube();
+    }
+
+    // Now:
+    // - smem[digit] contains local histogram (total count per digit in this tile)
+    // - kr[j] contains block-global rank (1-indexed) for each key
+}
+
+#[cube]
+fn decoupled_lookback(
+    histograms: &Array<Atomic<u32>>,            // global histogram buffer
+    partition_status: &mut Array<Atomic<u32>>,  // storage for partition information
+    smem_histogram: &SharedMemory<Atomic<u32>>, // local histogram from Step 3
+    global_prefix_smem: &mut SharedMemory<u32>, // to cache global prefix
+    pass: u32,
+    partition_mask_info: &PartitionMaskInfo,
+) {
+    let partition_base = CUBE_POS * HISTOGRAM_SIZE_U32;
+
+    if CUBE_POS == 0 {
+        // First block: read directly from pre-computed global prefix
+        if UNIT_POS < HISTOGRAM_SIZE_U32 {
+            let hist_offset = pass * HISTOGRAM_SIZE_U32 + UNIT_POS;
+            let global_prefix = Atomic::load(&histograms[hist_offset]);
+            let local_prefix = Atomic::load(&smem_histogram[UNIT_POS]);
+
+            // Cache global prefix for Step 8
+            global_prefix_smem[UNIT_POS] = global_prefix;
+
+            // Publish inclusive prefix with PREFIX status
+            let inc = global_prefix + local_prefix;
+            // partition_base is zero here since CUBE_POS is zero
+            Atomic::store(
+                &partition_status[UNIT_POS],
+                inc | partition_mask_info.mask_prefix,
+            );
+            sync_storage();
+        }
+    } else {
+        // All the later blocks
+
+        // Publish local reduction first (so later blocks can see us)
+        if UNIT_POS < HISTOGRAM_SIZE_U32 {
+            let local_reduction = Atomic::load(&smem_histogram[UNIT_POS]);
+            Atomic::store(
+                &partition_status[partition_base + UNIT_POS],
+                local_reduction | partition_mask_info.mask_reduction,
+            );
+            sync_storage();
+        }
+
+        // Look back to compute exclusive prefix
+        if UNIT_POS < HISTOGRAM_SIZE_U32 {
+            let mut global_prefix: u32 = 0;
+            // We need partitions from the previous block
+            let mut partition_base_prev = partition_base - HISTOGRAM_SIZE_U32;
+
+            // Spin until we find a PREFIX
+            loop {
+                let prev = Atomic::load(&partition_status[partition_base_prev + UNIT_POS]);
+                let status = prev & STATUS_MASK;
+
+                if status != partition_mask_info.mask_invalid {
+                    // Valid entry - accumulate count
+                    global_prefix += prev & COUNT_MASK;
+
+                    if status == partition_mask_info.mask_prefix {
+                        // Found a prefix - we're done
+                        break;
+                    } else {
+                        // It's a reduction - keep looking back
+                        partition_base_prev -= HISTOGRAM_SIZE_U32;
+                    }
+                }
+                // If INVALID, just loop again (spin-wait)
+            }
+
+            // Cache global prefix for Step 8
+            global_prefix_smem[UNIT_POS] = global_prefix;
+
+            // Upgrade our REDUCTION to PREFIX
+            // Adding (exc | 0x40000000) flips REDUCTION (0b01) to PREFIX (0b10)
+            // because 0b01 + 0b01 = 0b10
+
+            Atomic::add(
+                &partition_status[UNIT_POS + partition_base],
+                global_prefix | (1u32 << 30),
+            );
+            sync_storage();
+        }
+    }
+
+    sync_cube();
+
+    // After this:
+    // - global_prefix_smem[digit] = global exclusive prefix for this block
+    // - smem[digit] = local histogram (unchanged, needed for Step 5)
+}
+
+#[cube]
+fn local_prefix_sum(smem: &SharedMemory<Atomic<u32>>, #[comptime] num_planes: u32) {
+    let lid = UNIT_POS;
+    let plane_idx = lid / PLANE_DIM;
+
+    // Inter-plane communication
+    let mut shared_totals = SharedMemory::<u32>::new(num_planes);
+
+    // 1. Local scan within plane
+    let original = Atomic::load(&smem[lid]);
+    let local_scan = plane_exclusive_sum(original);
+
+    // 2. Plane totals -> shared memory
+    let plane_total =
+        plane_shuffle(local_scan, PLANE_DIM - 1) + plane_shuffle(original, PLANE_DIM - 1);
+
+    if UNIT_POS_PLANE == 0 {
+        shared_totals[plane_idx] = plane_total;
+    }
+    sync_cube();
+
+    // 3. Scan totals (single plane or serial)
+    if plane_idx == 0 && UNIT_POS_PLANE < num_planes {
+        let offset = plane_exclusive_sum(shared_totals[UNIT_POS_PLANE]);
+        shared_totals[UNIT_POS_PLANE] = offset;
+    }
+    sync_cube();
+
+    // 4. Apply offset from previous planes
+    let result = local_scan + shared_totals[plane_idx];
+    Atomic::store(&smem[lid], result);
+
+    sync_cube();
+}
+
+#[cube]
+fn rank_to_local_index(
+    kv: &Array<u32>,
+    kr: &mut Array<u32>,
+    histogram_smem: &SharedMemory<Atomic<u32>>, // now contains local prefix sums
+    pass: u32,
+) {
+    for j in 0..TILE_SIZE_U32 {
+        let digit = extract_digit(pass, kv[j]);
+        let local_prefix = Atomic::load(&histogram_smem[digit]); // where this digit starts in tile
+        let rank = kr[j]; // block-global rank (1-indexed)
+
+        let local_idx = local_prefix + rank; // position within tile (1-indexed)
+
+        kr[j] = rank | (local_idx << 16); // pack both
+    }
+}
+
+/// Step 7: Reorder keys within tile using shared memory
+///
+/// Before: kv[j] = keys in original load order
+///         kr[j] = (local_idx << 16) | rank
+/// After:  kv[j] = keys in digit-sorted order within tile
+///         kr[j] = rank only (lower 16 bits)
+#[cube]
+fn reorder_in_shared_memory(
+    kv: &mut Array<u32>,
+    kr: &mut Array<u32>,
+    reorder_smem: &mut SharedMemory<u32>, // size = tile_size
+) {
+    // Gather pattern must match fill_kv's loading pattern (plane-based)
+    let plane_keyvals = PLANE_DIM * TILE_SIZE_U32;
+    let plane_id = UNIT_POS / PLANE_DIM;
+    let plane_lane = UNIT_POS % PLANE_DIM;
+    let base_idx = plane_id * plane_keyvals + plane_lane;
+
+    // --- Scatter keys to sorted positions ---
+    #[unroll]
+    for j in 0..TILE_SIZE_U32 {
+        let local_idx = kr[j] >> 16; // destination (1-indexed)
+        reorder_smem[local_idx - 1] = kv[j]; // -1 for 0-indexed
+    }
+
+    sync_cube();
+
+    // --- Gather keys back in plane-strided order ---
+    #[unroll]
+    for j in 0..TILE_SIZE_U32 {
+        let smem_idx = base_idx + j * PLANE_DIM;
+        kv[j] = reorder_smem[smem_idx];
+    }
+
+    sync_cube();
+
+    // --- Scatter kr to sorted positions in reorder_smem (need rank for Step 8) ---
+    #[unroll]
+    for j in 0..TILE_SIZE_U32 {
+        let local_idx = kr[j] >> 16;
+        reorder_smem[local_idx - 1] = kr[j] & 0xFFFF; // store just rank
+    }
+
+    sync_cube();
+
+    // --- Gather kr back in plane-strided order ---
+    #[unroll]
+    for j in 0..TILE_SIZE_U32 {
+        let smem_idx = base_idx + j * PLANE_DIM;
+        kr[j] = reorder_smem[smem_idx];
+    }
+
+    sync_cube();
+}
+
+/// Step 8: Convert local rank to global output index
+///
+/// Before: kv[j] = keys in digit-sorted order within tile
+///         kr[j] = rank within digit group (1-indexed)
+///         scatter_smem[digit] = global exclusive prefix for this block
+/// After:  kr[j] = final global output index
+#[cube]
+fn local_to_global_index(
+    kv: &Array<u32>,
+    kr: &mut Array<u32>,
+    scatter_smem: &SharedMemory<u32>, // global prefixes from Step 4
+    pass: u32,
+) {
+    #[unroll]
+    for j in 0..TILE_SIZE_U32 {
+        let digit = extract_digit(pass, kv[j]);
+        let global_prefix = scatter_smem[digit];
+        let rank = kr[j]; // 1-indexed
+
+        kr[j] = global_prefix + rank - 1; // 0-indexed global position
+    }
+}
+
+/// Step 9: Store keys to global memory
+#[cube]
+fn store_to_global(kv: &Array<u32>, kr: &Array<u32>, keys_out: &mut Array<u32>) {
+    #[unroll]
+    for j in 0..TILE_SIZE_U32 {
+        let global_idx = kr[j];
+        keys_out[global_idx] = kv[j];
+    }
+}
+
+#[cube(launch_unchecked)]
+fn kernel_scatter(
+    keys_in: &Array<u32>,
+    keys_out: &mut Array<u32>,
+    histograms: &Array<Atomic<u32>>,
+    partition_status: &mut Array<Atomic<u32>>,
+    partition_mask_info: &PartitionMaskInfo,
+    pass: u32, // Runtime parameter - changes per pass
+    #[comptime] num_planes: u32,
+) {
+    // Allocate registers/local memory for the current "tile" of keys
+    let mut kv = Array::<u32>::new(comptime!(TILE_SIZE_U32));
+
+    // kr will hold (count | rank) for current tile's digits
+    let mut kr = Array::<u32>::new(comptime!(TILE_SIZE_U32));
+
+    // Step 1: Read keys from global memory
+    fill_kv_scatter(keys_in, &mut kv);
+
+    // Step 2: Compute local count + rank for each item in tile and store in kr
+    compute_local_count_and_rank(&kv, &mut kr, pass);
+
+    // Shared memory for block-level histogram
+
+    // Histogram: atomic during accumulation, becomes local prefix after step 5
+    let histogram_smem = SharedMemory::<Atomic<u32>>::new(HISTOGRAM_SIZE_U32);
+
+    // Reorder buffer (step 7 only) - needs space for all keys in the tile
+    let mut reorder_smem = SharedMemory::<u32>::new(comptime!(SCATTER_BLOCK_KVS as u32));
+
+    // Step 3: Accumulate local histogram
+    accumulate_local_histogram(&kv, &mut kr, &histogram_smem, pass);
+
+    // Global prefixes from look-back (step 4), read in step 8
+    let mut global_prefix_smem = SharedMemory::<u32>::new(HISTOGRAM_SIZE_U32);
+    // Step 4. Decoupled Lookback
+    decoupled_lookback(
+        histograms,
+        partition_status,
+        &histogram_smem,
+        &mut global_prefix_smem,
+        pass,
+        partition_mask_info,
+    );
+
+    // Step 5: Prefix scan of local histogram in shared memory
+    // Restrict to first HISTOGRAM_SIZE_U32 threads
+    if UNIT_POS < HISTOGRAM_SIZE_U32 {
+        local_prefix_sum(&histogram_smem, num_planes);
+    }
+    sync_cube();
+
+    // Step 6:
+    rank_to_local_index(&kv, &mut kr, &histogram_smem, pass);
+
+    // Step 7
+    reorder_in_shared_memory(&mut kv, &mut kr, &mut reorder_smem);
+
+    // Step 8
+    local_to_global_index(&kv, &mut kr, &global_prefix_smem, pass);
+
+    // Step 9
+    store_to_global(&kv, &kr, keys_out);
+}
+
+/// Run one scatter pass
+fn run_scatter_pass<R: Runtime>(
+    client: &ComputeClient<R::Server>,
+    keys_in: &Handle,
+    keys_out: &Handle,
+    histograms: &Handle,
+    partition_status: &Handle,
+    pass: u32,
+    padded_size: usize,
+    num_blocks: usize,
+    num_planes: u32,
+) {
+    let partition_mask = if pass % 2 == 0 {
+        even_partition_mask_info::<R>()
+    } else {
+        odd_partition_mask_info::<R>()
+    };
+
+    unsafe {
+        kernel_scatter::launch_unchecked::<R>(
+            client,
+            CubeCount::Static(num_blocks as u32, 1, 1),
+            CubeDim::new(SCATTER_BLOCK_SIZE as u32, 1, 1),
+            ArrayArg::from_raw_parts::<u32>(keys_in, padded_size, 1),
+            ArrayArg::from_raw_parts::<u32>(keys_out, padded_size, 1),
+            ArrayArg::from_raw_parts::<u32>(histograms, NUM_DIGITS * HISTOGRAM_SIZE, 1),
+            ArrayArg::from_raw_parts::<u32>(partition_status, num_blocks * HISTOGRAM_SIZE, 1),
+            partition_mask,
+            ScalarArg::new(pass),
+            num_planes,
+        );
+    }
+}
+
+/// Sort u32 values using GPU radix sort.
+/// Returns the sorted data.
+pub fn radix_sort_u32<R: Runtime>(client: &ComputeClient<R::Server>, input: &[u32]) -> Vec<u32> {
+    let original_len = input.len();
+    if original_len == 0 {
+        return vec![];
+    }
+
+    const ELEM_SIZE: usize = std::mem::size_of::<u32>();
+
+    // Each block processes SCATTER_BLOCK_KVS keys (256 threads × 15 items = 3840)
+    // Pad input to next multiple of SCATTER_BLOCK_KVS
+    let padded_size = original_len.next_multiple_of(SCATTER_BLOCK_KVS);
+    let num_blocks = padded_size / SCATTER_BLOCK_KVS;
+
+    // Create padded input - use 0xFFFFFFFF for padding (sorts to end)
+    let padded_input: Vec<u32> = if padded_size == original_len {
+        input.to_vec()
+    } else {
+        let mut padded = Vec::with_capacity(padded_size);
+        padded.extend_from_slice(input);
+        padded.resize(padded_size, 0xFFFFFFFF);
+        padded
+    };
+
+    // Double-buffer for ping-pong between passes
+    let keys_a = client.create(u32::as_bytes(&padded_input));
+    let keys_b = client.empty(padded_size * ELEM_SIZE);
+
+    // Zero-initialize histogram buffer (required for atomic adds)
+    let histo_zeros = vec![0u32; NUM_DIGITS * HISTOGRAM_SIZE];
+    let histograms = client.create(u32::as_bytes(&histo_zeros));
+
+    // Step 1: Calculate histogram for all passes at once
+    unsafe {
+        kernel_calc_histogram::launch_unchecked::<R>(
+            client,
+            CubeCount::Static(num_blocks as u32, 1, 1),
+            CubeDim::new(HISTOGRAM_BLOCK_SIZE as u32, 1, 1),
+            ArrayArg::from_raw_parts::<u32>(&keys_a, padded_size, 1),
+            ArrayArg::from_raw_parts::<u32>(&histograms, NUM_DIGITS * HISTOGRAM_SIZE, 1),
+        );
+    }
+
+    // Step 2: Prefix sum each pass's histogram
+    let num_planes = PREFIX_BLOCK_SIZE as u32 / PLANE_DIM;
+    unsafe {
+        kernel_prefix_histogram::launch_unchecked::<R>(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new(PREFIX_BLOCK_SIZE as u32, 1, 1),
+            ArrayArg::from_raw_parts::<u32>(&histograms, NUM_DIGITS * HISTOGRAM_SIZE, 1),
+            num_planes,
+        );
+    }
+
+    // Single partition buffer - wgpu inserts memory barriers between dispatches
+    // accessing the same buffers when they're in the same command buffer
+    let partition_zeros = vec![0u32; num_blocks * HISTOGRAM_SIZE];
+    let partition_status = client.create(u32::as_bytes(&partition_zeros));
+
+    // Step 3: Run all 4 scatter passes
+    //
+    // LIMITATIONS due to decoupled lookback + GPU forward progress:
+    // - Set CUBECL_WGPU_MAX_TASKS=1000 to batch kernels together
+    // - Max 7 blocks (~27K elements) for fast operation
+    // - 8 blocks works but is ~600x slower due to scheduling contention
+    // - 9+ blocks deadlocks (spin-wait starvation)
+    run_scatter_pass::<R>(
+        client,
+        &keys_a,
+        &keys_b,
+        &histograms,
+        &partition_status,
+        0,
+        padded_size,
+        num_blocks,
+        num_planes,
+    );
+    run_scatter_pass::<R>(
+        client,
+        &keys_b,
+        &keys_a,
+        &histograms,
+        &partition_status,
+        1,
+        padded_size,
+        num_blocks,
+        num_planes,
+    );
+    run_scatter_pass::<R>(
+        client,
+        &keys_a,
+        &keys_b,
+        &histograms,
+        &partition_status,
+        2,
+        padded_size,
+        num_blocks,
+        num_planes,
+    );
+    run_scatter_pass::<R>(
+        client,
+        &keys_b,
+        &keys_a,
+        &histograms,
+        &partition_status,
+        3,
+        padded_size,
+        num_blocks,
+        num_planes,
+    );
+
+    // Final result is in keys_a - truncate to original length
+    // (padding values 0xFFFFFFFF sort to the end)
+    let result = client.read_one(keys_a.clone());
+    let sorted = u32::from_bytes(&result);
+    sorted[..original_len].to_vec()
+}
+
+/// Sort buffers for GPU-only radix sort (no CPU transfers during sort)
+pub struct RadixSortBuffers {
+    pub keys_a: Handle,
+    pub keys_b: Handle,
+    pub padded_size: usize,
+    pub original_len: usize,
+    pub num_blocks: usize,
+    pub num_planes: u32,
+}
+
+/// Create reusable sort buffers for a given size.
+/// Call this once, then use `radix_sort_u32_gpu` for GPU-only sorting.
+pub fn create_sort_buffers<R: Runtime>(
+    client: &ComputeClient<R::Server>,
+    max_elements: usize,
+) -> RadixSortBuffers {
+    const ELEM_SIZE: usize = std::mem::size_of::<u32>();
+
+    let padded_size = max_elements.next_multiple_of(SCATTER_BLOCK_KVS);
+    let num_blocks = padded_size / SCATTER_BLOCK_KVS;
+
+    let keys_a = client.empty(padded_size * ELEM_SIZE);
+    let keys_b = client.empty(padded_size * ELEM_SIZE);
+
+    let num_planes = PREFIX_BLOCK_SIZE as u32 / PLANE_DIM;
+
+    RadixSortBuffers {
+        keys_a,
+        keys_b,
+        padded_size,
+        original_len: max_elements,
+        num_blocks,
+        num_planes,
+    }
+}
+
+/// GPU-only radix sort: sorts data already in keys_a buffer.
+/// Result ends up in keys_a. Does NOT sync - call client.sync() after if needed.
+pub fn radix_sort_u32_gpu<R: Runtime>(
+    client: &ComputeClient<R::Server>,
+    buffers: &RadixSortBuffers,
+) {
+    let RadixSortBuffers {
+        keys_a,
+        keys_b,
+        padded_size,
+        num_blocks,
+        num_planes,
+        ..
+    } = buffers;
+
+    // Create histogram buffer (small: 4 * 256 = 1KB)
+    let histo_zeros = vec![0u32; NUM_DIGITS * HISTOGRAM_SIZE];
+    let histograms = client.create(u32::as_bytes(&histo_zeros));
+
+    // Step 1: Calculate histogram
+    unsafe {
+        kernel_calc_histogram::launch_unchecked::<R>(
+            client,
+            CubeCount::Static(*num_blocks as u32, 1, 1),
+            CubeDim::new(HISTOGRAM_BLOCK_SIZE as u32, 1, 1),
+            ArrayArg::from_raw_parts::<u32>(keys_a, *padded_size, 1),
+            ArrayArg::from_raw_parts::<u32>(&histograms, NUM_DIGITS * HISTOGRAM_SIZE, 1),
+        );
+    }
+
+    // Step 2: Prefix sum histogram
+    unsafe {
+        kernel_prefix_histogram::launch_unchecked::<R>(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new(PREFIX_BLOCK_SIZE as u32, 1, 1),
+            ArrayArg::from_raw_parts::<u32>(&histograms, NUM_DIGITS * HISTOGRAM_SIZE, 1),
+            *num_planes,
+        );
+    }
+
+    // Partition buffer for decoupled lookback
+    let partition_zeros = vec![0u32; *num_blocks * HISTOGRAM_SIZE];
+    let partition_status = client.create(u32::as_bytes(&partition_zeros));
+
+    // Step 3: Run all 4 scatter passes
+    // WARNING: Max 7 blocks (~27K elements) due to GPU forward progress limits
+    run_scatter_pass::<R>(
+        client, keys_a, keys_b, &histograms, &partition_status,
+        0, *padded_size, *num_blocks, *num_planes,
+    );
+    run_scatter_pass::<R>(
+        client, keys_b, keys_a, &histograms, &partition_status,
+        1, *padded_size, *num_blocks, *num_planes,
+    );
+    run_scatter_pass::<R>(
+        client, keys_a, keys_b, &histograms, &partition_status,
+        2, *padded_size, *num_blocks, *num_planes,
+    );
+    run_scatter_pass::<R>(
+        client, keys_b, keys_a, &histograms, &partition_status,
+        3, *padded_size, *num_blocks, *num_planes,
+    );
+    // Result is now in keys_a
+}
