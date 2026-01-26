@@ -811,20 +811,48 @@ pub fn radix_sort_u32_gpu<R: Runtime>(
     // Step 3: Run all 4 scatter passes
     // WARNING: Max 7 blocks (~27K elements) due to GPU forward progress limits
     run_scatter_pass::<R>(
-        client, keys_a, keys_b, &histograms, &partition_status,
-        0, *padded_size, *num_blocks, *num_planes,
+        client,
+        keys_a,
+        keys_b,
+        &histograms,
+        &partition_status,
+        0,
+        *padded_size,
+        *num_blocks,
+        *num_planes,
     );
     run_scatter_pass::<R>(
-        client, keys_b, keys_a, &histograms, &partition_status,
-        1, *padded_size, *num_blocks, *num_planes,
+        client,
+        keys_b,
+        keys_a,
+        &histograms,
+        &partition_status,
+        1,
+        *padded_size,
+        *num_blocks,
+        *num_planes,
     );
     run_scatter_pass::<R>(
-        client, keys_a, keys_b, &histograms, &partition_status,
-        2, *padded_size, *num_blocks, *num_planes,
+        client,
+        keys_a,
+        keys_b,
+        &histograms,
+        &partition_status,
+        2,
+        *padded_size,
+        *num_blocks,
+        *num_planes,
     );
     run_scatter_pass::<R>(
-        client, keys_b, keys_a, &histograms, &partition_status,
-        3, *padded_size, *num_blocks, *num_planes,
+        client,
+        keys_b,
+        keys_a,
+        &histograms,
+        &partition_status,
+        3,
+        *padded_size,
+        *num_blocks,
+        *num_planes,
     );
     // Result is now in keys_a
 }
@@ -836,7 +864,8 @@ fn main() {
     type R = cubecl::wgpu::WgpuRuntime;
 
     // Test with 7 blocks (~27K elements) - the reliable fast limit
-    let count = 26_880u32;
+    // let count = 26_880u32;
+    let count = 65_550u32;
     let input_data: Vec<u32> = (1..=count).rev().collect();
     println!(
         "Sorting {} elements (padded to {})...",
@@ -889,20 +918,48 @@ fn main() {
 
     // Queue all 4 scatter passes
     run_scatter_pass::<R>(
-        &client, &keys_a, &keys_b, &histograms, &partition_status,
-        0, padded_size, num_blocks, num_planes,
+        &client,
+        &keys_a,
+        &keys_b,
+        &histograms,
+        &partition_status,
+        0,
+        padded_size,
+        num_blocks,
+        num_planes,
     );
     run_scatter_pass::<R>(
-        &client, &keys_b, &keys_a, &histograms, &partition_status,
-        1, padded_size, num_blocks, num_planes,
+        &client,
+        &keys_b,
+        &keys_a,
+        &histograms,
+        &partition_status,
+        1,
+        padded_size,
+        num_blocks,
+        num_planes,
     );
     run_scatter_pass::<R>(
-        &client, &keys_a, &keys_b, &histograms, &partition_status,
-        2, padded_size, num_blocks, num_planes,
+        &client,
+        &keys_a,
+        &keys_b,
+        &histograms,
+        &partition_status,
+        2,
+        padded_size,
+        num_blocks,
+        num_planes,
     );
     run_scatter_pass::<R>(
-        &client, &keys_b, &keys_a, &histograms, &partition_status,
-        3, padded_size, num_blocks, num_planes,
+        &client,
+        &keys_b,
+        &keys_a,
+        &histograms,
+        &partition_status,
+        3,
+        padded_size,
+        num_blocks,
+        num_planes,
     );
 
     // Flush all queued commands as a single batch
