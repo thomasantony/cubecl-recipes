@@ -4,43 +4,50 @@ A GPU-accelerated radix sort implementation using CubeCL, based on the algorithm
 
 ## Algorithm
 
-This implementation uses a **decoupled look-back** approach for efficient parallel prefix sums across workgroups, as described in:
+The inter-workgroup prefix uses **Decoupled Fallback**, a portable variant of
+decoupled look-back:
 
-- Merrill, D., & Garland, M. (2016). *Single-pass Parallel Prefix Scan with Decoupled Look-back*. NVIDIA Technical Report NVR-2016-002.
+- Merrill, D., & Garland, M. (2016). *Single-pass Parallel Prefix Scan with Decoupled Look-back*.
+- Smith, T., Levien, R., & Owens, J. D. (2025). *Decoupled Fallback: A Portable Single-Pass GPU Scan*. SPAA '25.
 
 The algorithm performs 4 passes (8 bits per pass for 32-bit keys):
 
-1. **Histogram**: Count occurrences of each digit (0-255) across all blocks
-2. **Prefix Sum**: Compute exclusive prefix sum of the global histogram
-3. **Scatter**: For each pass, redistribute keys to their sorted positions using:
-   - Local histogram accumulation within each block
-   - Decoupled look-back to compute global prefixes
-   - Local reordering in shared memory
-   - Global scatter to output
+1. **Histogram**: Count occurrences of each digit (0-255) for all 4 passes at once
+   (this kernel also zeroes the per-pass partition status regions)
+2. **Prefix Sum**: Exclusive prefix sum of each pass's global histogram
+3. **Scatter** (per pass, one workgroup per tile of 3840 keys):
+   - Rank each key within its plane (ballot) and within its tile (shared-memory histogram)
+   - Publish the tile's per-digit reduction (`READY`), then look back over predecessor
+     tiles until a `PREFIX` is found. If a predecessor is still `NOT_READY` after
+     `max_spins` polls, the whole workgroup recomputes that tile's reduction from the
+     input keys and inserts it with `atomicMax` (**fallback**), so no workgroup ever
+     waits on one that has not been scheduled.
+   - Publish the tile's inclusive prefix (`PREFIX`), reorder the tile in shared memory,
+     and scatter to the output
 
-## References
+Partition status words are `status (2 bits) | count (30 bits)` with the monotonic
+encoding `NOT_READY (0) < READY (1) < PREFIX (2)`, so all publications are `atomicMax`
+and can never move a tile backwards. Each pass has its own status region.
 
-- [wgpu_sort](https://crates.io/crates/wgpu_sort) - The reference WebGPU implementation
-- [Fuchsia Radix Sort](https://fuchsia.googlesource.com/fuchsia/+/refs/heads/main/src/graphics/lib/compute/radix_sort/) - Google's Vulkan implementation
-- [CubeCL](https://github.com/tracel-ai/cubecl) - The GPU compute framework used
+## Testing
+
+```bash
+# Default config: random + adversarial inputs, compared against std's sort
+cargo run --release --bin 07_radix_sort -- 20
+# Withhold tile reductions and use 0 spins: nearly every look-back step falls back
+cargo run --release --bin 07_radix_sort -- --force-fallback 20 3841 65550 1000000
+# Custom spin limit / sizes
+cargo run --release --bin 07_radix_sort -- --spins 16 10 4000000 16000000
+```
+
+Each line reports the best time and the GPU-side fallback / look-back step counters.
 
 ## Limitations
 
-- Currently requires input size to be a multiple of 3840 (SCATTER_BLOCK_SIZE × TILE_SIZE)
-- Limited to 2 blocks (7680 elements max) due to decoupled look-back scheduling issues
 - Keys-only sorting (no key-value pairs yet)
-- Tested with wgpu backend
-
-## Known Issues
-
-The decoupled look-back algorithm requires all GPU blocks to run concurrently. On some GPUs
-or with certain block counts, blocks may be scheduled out of order causing the spin-wait
-to hang. The original wgpu_sort implementation avoids this by:
-
-1. Using shared memory instead of subgroup ballot operations for rank calculation
-2. GPU-side padding in a separate kernel pass
-
-These optimizations are not yet implemented in this CubeCL version.
+- Up to 2^30 - 1 keys (30-bit counts in the partition status words)
+- Requires a plane (subgroup) size between 8 and 32
+- Tested with the wgpu backend (Metal)
 
 ## Usage
 
@@ -50,6 +57,6 @@ use cubecl::wgpu::WgpuRuntime;
 let device = Default::default();
 let client = WgpuRuntime::client(&device);
 
-let input: Vec<u32> = (1..=7680).rev().collect();
+let input: Vec<u32> = (1..=1_000_000).rev().collect();
 let sorted = radix_sort_u32::<WgpuRuntime>(&client, &input);
 ```
