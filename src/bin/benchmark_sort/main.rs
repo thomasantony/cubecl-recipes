@@ -1,6 +1,19 @@
-// Benchmark comparing CubeCL radix sort vs wgpu_sort
+// Benchmark comparing CubeCL radix sort (decoupled fallback) vs wgpu_sort.
 //
-// Both implementations use the same underlying GPU but through different wgpu versions.
+// Methodology (identical for both sorters):
+// - Same random u32 input for both, regenerated per size.
+// - Before every timed run the input is re-uploaded and the GPU is idle (untimed),
+//   so each run sorts the same unsorted data from scratch.
+// - The timed region is: record/launch one complete sort + wait for the GPU to finish.
+// - Report best and median over RUNS timed runs (after WARMUP untimed runs).
+// - After timing, both results are downloaded and checked against std's sort and
+//   against each other.
+//
+// Caveat: wgpu_sort always sorts key/value pairs (it has no keys-only mode), so it
+// also moves a 4-byte payload per key in each scatter pass; CubeCL sorts keys only.
+// The two also use different wgpu versions (wgpu_sort: wgpu 0.20). On Metal, wgpu 0.20's
+// submit+wait round trip is ~1.3 ms and wgpu_sort timings are quantised to multiples of
+// it, so small sizes mostly measure that overhead; the round trip is printed for reference.
 
 use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
@@ -8,12 +21,42 @@ use std::time::{Duration, Instant};
 use cubecl::client::ComputeClient;
 use cubecl::prelude::*;
 
-use wgpu_sort::utils::guess_workgroup_size;
 use wgpu_sort::GPUSorter;
+use wgpu_sort::utils::{download_buffer, guess_workgroup_size};
 
 // Shared CubeCL radix sort implementation (decoupled fallback)
 #[path = "../07_radix_sort/radix_sort.rs"]
 mod radix_sort;
+
+const WARMUP: usize = 3;
+const RUNS: usize = 15;
+
+struct Timing {
+    best: Duration,
+    median: Duration,
+}
+
+impl Timing {
+    fn from_samples(mut samples: Vec<Duration>) -> Self {
+        samples.sort();
+        Self {
+            best: samples[0],
+            median: samples[samples.len() / 2],
+        }
+    }
+}
+
+fn random_keys(n: usize, seed: u64) -> Vec<u32> {
+    let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+    (0..n)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 16) as u32
+        })
+        .collect()
+}
 
 /// Context for wgpu_sort benchmarking
 struct WgpuSortContext {
@@ -25,11 +68,9 @@ struct WgpuSortContext {
 impl WgpuSortContext {
     async fn new() -> Self {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
-
         let adapter = wgpu::util::initialize_adapter_from_env_or_default(&instance, None)
             .await
             .expect("Failed to find adapter");
-
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
@@ -46,20 +87,13 @@ impl WgpuSortContext {
             .await
             .expect("Failed to create device");
 
-        // Try to guess subgroup size, fallback to 32 (common for Apple Silicon)
-        let subgroup_size = match guess_workgroup_size(&device, &queue).await {
-            Some(size) => {
-                println!("wgpu_sort detected subgroup size: {}", size);
-                size
-            }
-            None => {
-                println!("wgpu_sort: could not detect subgroup size, using 32");
-                32
-            }
-        };
+        let subgroup_size = guess_workgroup_size(&device, &queue).await.unwrap_or_else(|| {
+            println!("wgpu_sort: could not detect subgroup size, using 32");
+            32
+        });
+        println!("wgpu_sort subgroup size: {subgroup_size}");
 
         let sorter = GPUSorter::new(&device, subgroup_size);
-
         Self {
             device,
             queue,
@@ -67,115 +101,183 @@ impl WgpuSortContext {
         }
     }
 
-    /// Benchmark sort - batch multiple iterations into single command buffer
-    fn bench_sort(&self, n: u32, warmup_iters: usize, bench_iters: usize) -> Duration {
-        let sort_buffers = self
-            .sorter
-            .create_sort_buffers(&self.device, NonZeroU32::new(n).unwrap());
+    /// Wall-clock time of submitting an empty command buffer and waiting for it.
+    fn round_trip(&self) -> Timing {
+        let samples = (0..WARMUP + RUNS)
+            .map(|_| {
+                let start = Instant::now();
+                let encoder = self
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                let idx = self.queue.submit([encoder.finish()]);
+                self.device
+                    .poll(wgpu::Maintain::WaitForSubmissionIndex(idx));
+                start.elapsed()
+            })
+            .skip(WARMUP)
+            .collect();
+        Timing::from_samples(samples)
+    }
 
-        // Warmup - batch all warmup iterations
-        {
+    fn wait_idle(&self) {
+        let idx = self.queue.submit([]);
+        self.device
+            .poll(wgpu::Maintain::WaitForSubmissionIndex(idx));
+    }
+
+    /// Returns timing and the sorted keys of the last run.
+    fn bench(&self, data: &[u32]) -> (Timing, Vec<u32>) {
+        let n = data.len();
+        let buffers = self
+            .sorter
+            .create_sort_buffers(&self.device, NonZeroU32::new(n as u32).unwrap());
+        // Payload is the original index (wgpu_sort always sorts key/value pairs)
+        let payload: Vec<u32> = (0..n as u32).collect();
+
+        let mut samples = Vec::with_capacity(RUNS);
+        for run in 0..WARMUP + RUNS {
+            self.queue
+                .write_buffer(buffers.keys(), 0, u32::as_bytes(data));
+            self.queue
+                .write_buffer(buffers.values(), 0, u32::as_bytes(&payload));
+            self.wait_idle();
+
+            let start = Instant::now();
             let mut encoder = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-            for _ in 0..warmup_iters {
-                self.sorter
-                    .sort(&mut encoder, &self.queue, &sort_buffers, None);
-            }
+            self.sorter.sort(&mut encoder, &self.queue, &buffers, None);
             let idx = self.queue.submit([encoder.finish()]);
             self.device
                 .poll(wgpu::Maintain::WaitForSubmissionIndex(idx));
+            let elapsed = start.elapsed();
+
+            if run >= WARMUP {
+                samples.push(elapsed);
+            }
         }
 
-        // Benchmark - batch all iterations into one command buffer
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-
-        let start = Instant::now();
-        for _ in 0..bench_iters {
-            self.sorter
-                .sort(&mut encoder, &self.queue, &sort_buffers, None);
-        }
-        let idx = self.queue.submit([encoder.finish()]);
-        self.device
-            .poll(wgpu::Maintain::WaitForSubmissionIndex(idx));
-        let elapsed = start.elapsed();
-
-        elapsed / bench_iters as u32
+        let sorted: Vec<u32> = pollster::block_on(download_buffer(
+            buffers.keys(),
+            &self.device,
+            &self.queue,
+            0..buffers.keys_valid_size(),
+        ));
+        (Timing::from_samples(samples), sorted)
     }
 }
 
-/// Benchmark CubeCL radix sort
-fn bench_cubecl_sort<R: Runtime>(
-    client: &ComputeClient<R::Server>,
-    n: usize,
-    warmup_iters: usize,
-    bench_iters: usize,
-) -> Duration {
-    // Generate test data once
-    let data: Vec<u32> = (0..n as u32).rev().collect();
+/// Returns timing and the sorted keys of the last run.
+fn bench_cubecl<R: Runtime>(client: &ComputeClient<R::Server>, data: &[u32]) -> (Timing, Vec<u32>) {
+    let n = data.len();
+    let mut buffers = radix_sort::create_sort_buffers::<R>(client, n);
+    let config = radix_sort::SortConfig::default();
 
-    // Warmup
-    for _ in 0..warmup_iters {
-        let _ = radix_sort::radix_sort_u32::<R>(client, &data);
+    let mut samples = Vec::with_capacity(RUNS);
+    for run in 0..WARMUP + RUNS {
+        radix_sort::upload_keys::<R>(client, &mut buffers, data);
+        cubecl::future::block_on(client.sync());
+
+        let start = Instant::now();
+        radix_sort::radix_sort_u32_gpu::<R>(client, &buffers, config);
+        cubecl::future::block_on(client.sync());
+        let elapsed = start.elapsed();
+
+        if run >= WARMUP {
+            samples.push(elapsed);
+        }
     }
 
-    // Benchmark
-    let start = Instant::now();
-    for _ in 0..bench_iters {
-        let _ = radix_sort::radix_sort_u32::<R>(client, &data);
-    }
-    let elapsed = start.elapsed();
+    let bytes = client.read_one(buffers.keys_a.clone());
+    let sorted = u32::from_bytes(&bytes)[..n].to_vec();
+    (Timing::from_samples(samples), sorted)
+}
 
-    elapsed / bench_iters as u32
+/// Wall-clock time of a sync with no work queued (CubeCL runtime overhead floor).
+fn cubecl_round_trip<R: Runtime>(client: &ComputeClient<R::Server>) -> Timing {
+    let samples = (0..WARMUP + RUNS)
+        .map(|_| {
+            let start = Instant::now();
+            cubecl::future::block_on(client.sync());
+            start.elapsed()
+        })
+        .skip(WARMUP)
+        .collect();
+    Timing::from_samples(samples)
+}
+
+fn ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1000.0
 }
 
 #[pollster::main]
 async fn main() {
-    println!("=== Radix Sort Benchmark: CubeCL vs wgpu_sort ===\n");
+    println!("=== Radix Sort Benchmark: CubeCL (keys) vs wgpu_sort (key/value) ===\n");
 
-    // Initialize both contexts
     let wgpu_ctx = WgpuSortContext::new().await;
 
-    let device = Default::default();
-    let cubecl_client = cubecl::wgpu::WgpuRuntime::client(&device);
     type R = cubecl::wgpu::WgpuRuntime;
+    let device = Default::default();
+    let cubecl_client = R::client(&device);
 
-    println!();
-
-    // Test sizes
     let sizes = [
         10_000, 50_000, 100_000, 500_000, 1_000_000, 2_000_000, 5_000_000, 10_000_000,
+        16_000_000,
     ];
 
-    let warmup = 3;
-    let iters = 10;
-
+    let wgpu_rt = wgpu_ctx.round_trip();
+    let cube_rt = cubecl_round_trip::<R>(&cubecl_client);
     println!(
-        "{:>12} {:>15} {:>15} {:>10}",
-        "Size", "wgpu_sort", "CubeCL", "Speedup"
+        "\nEmpty submit+wait round trip (best / median ms): wgpu_sort {:.3} / {:.3}, CubeCL {:.3} / {:.3}",
+        ms(wgpu_rt.best),
+        ms(wgpu_rt.median),
+        ms(cube_rt.best),
+        ms(cube_rt.median)
     );
-    println!("{}", "-".repeat(55));
+    println!(
+        "\n{} timed runs per size (after {} warmup), times in ms: best / median\n",
+        RUNS, WARMUP
+    );
+    println!(
+        "{:>10}  {:>19}  {:>19}  {:>14}  {}",
+        "Size", "wgpu_sort", "CubeCL", "Speedup(best)", "Check"
+    );
+    println!("{}", "-".repeat(78));
 
-    for &size in &sizes {
-        // Benchmark wgpu_sort
-        let wgpu_time = wgpu_ctx.bench_sort(size as u32, warmup, iters);
+    let mut all_ok = true;
+    for (i, &size) in sizes.iter().enumerate() {
+        let data = random_keys(size, i as u64 + 1);
+        let mut expected = data.clone();
+        expected.sort_unstable();
 
-        // Benchmark CubeCL
-        let cubecl_time = bench_cubecl_sort::<R>(&cubecl_client, size, warmup, iters);
+        let (wgpu_t, wgpu_out) = wgpu_ctx.bench(&data);
+        let (cube_t, cube_out) = bench_cubecl::<R>(&cubecl_client, &data);
 
-        // Calculate speedup (positive = CubeCL faster)
-        let speedup = wgpu_time.as_secs_f64() / cubecl_time.as_secs_f64();
+        let wgpu_ok = wgpu_out == expected;
+        let cube_ok = cube_out == expected;
+        let agree = wgpu_out == cube_out;
+        all_ok &= wgpu_ok && cube_ok && agree;
+        let check = match (wgpu_ok, cube_ok, agree) {
+            (true, true, true) => "ok".to_string(),
+            _ => format!("MISMATCH (wgpu_sort {wgpu_ok}, cubecl {cube_ok}, agree {agree})"),
+        };
 
         println!(
-            "{:>12} {:>12.3}ms {:>12.3}ms {:>9.2}x",
+            "{:>10}  {:>8.3} / {:>8.3}  {:>8.3} / {:>8.3}  {:>13.2}x  {}",
             size,
-            wgpu_time.as_secs_f64() * 1000.0,
-            cubecl_time.as_secs_f64() * 1000.0,
-            speedup
+            ms(wgpu_t.best),
+            ms(wgpu_t.median),
+            ms(cube_t.best),
+            ms(cube_t.median),
+            wgpu_t.best.as_secs_f64() / cube_t.best.as_secs_f64(),
+            check
         );
     }
 
-    println!("\nSpeedup > 1.0 means CubeCL is faster");
+    println!("\nSpeedup > 1.0 means CubeCL is faster.");
+    println!("Note: wgpu_sort also moves a payload per key (key/value sort).");
+    if !all_ok {
+        println!("SOME RESULTS DID NOT MATCH std sort");
+        std::process::exit(1);
+    }
 }
