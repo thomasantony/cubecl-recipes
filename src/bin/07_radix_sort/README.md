@@ -159,25 +159,38 @@ Each size prints the best time and the GPU-side fallback and look-back counters.
 ## Benchmarks
 
 ```bash
-cargo bench --bench sort                    # vs CPU sort_unstable
-cargo run --release --bin benchmark_sort    # vs wgpu_sort
+cargo run --release --bin benchmark_sort    # vs wgpu_sort and CPU std sorts (main benchmark)
+cargo bench --bench sort                    # quick GPU vs CPU sort_unstable
 ```
 
 Both benchmarks upload the input before each timed run, without timing it. A timed run is
 one full sort plus waiting for the GPU to finish, and each benchmark checks its results
-against `std` sort. `benchmark_sort` gives both sorters the same input, reports best and
-median over 15 runs, and checks that the two outputs agree.
+against `std` sort. `benchmark_sort` gives every sorter the same input, reports best and
+median over 15 runs, and checks that the GPU outputs agree. The CPU sorts each get a fresh
+copy of the input per run, made outside the timed region.
 
-Results on an Apple M5 Max (wgpu / Metal):
+Results from one `benchmark_sort` run on an Apple M5 Max (wgpu / Metal), best of 15:
 
-| Keys | CubeCL (best) | CPU `sort_unstable` | wgpu_sort (best) |
-|-----:|--------------:|--------------------:|-----------------:|
-| 1M   | 0.95 ms | 7.8 ms | 6.4 ms |
-| 5M   | 1.63 ms | — | 10.2 ms |
-| 10M  | 2.44 ms | — | 17.7 ms |
-| 16M  | 3.13 ms | 145 ms | 29.1 ms |
+| Keys | CubeCL | wgpu_sort | CPU `sort_unstable` | CPU `sort` (stable) | CubeCL vs wgpu_sort | CubeCL vs `sort_unstable` |
+|-----:|-------:|----------:|--------------------:|--------------------:|----:|----:|
+| 10K   | 0.67 ms | 3.86 ms | 0.09 ms | 0.09 ms | 5.7× | 0.13× |
+| 100K  | 0.63 ms | 3.79 ms | 0.77 ms | 0.88 ms | 6.0× | 1.2× |
+| 1M    | 0.71 ms | 3.84 ms | 7.77 ms | 9.17 ms | 5.4× | 11× |
+| 2M    | 0.72 ms | 4.98 ms | 16.3 ms | 20.2 ms | 6.9× | 22× |
+| 4M    | 1.00 ms | 7.75 ms | 33.8 ms | 45.3 ms | 7.8× | 34× |
+| 5M    | 1.24 ms | 9.93 ms | 43.2 ms | 61.7 ms | 8.0× | 35× |
+| 10M   | 2.08 ms | 17.8 ms | 90.7 ms | 126 ms  | 8.5× | 44× |
+| 16M   | 3.11 ms | 28.7 ms | 147 ms  | 206 ms  | 9.2× | 47× |
+| 33.5M | 6.15 ms | 65.8 ms | 323 ms  | 441 ms  | 10.7× | 52× |
 
-The CPU and wgpu_sort columns come from different benchmark runs.
+Up to about 2M keys the CubeCL time is dominated by its fixed cost of 7 kernel launches
+plus a sync (about 0.6–0.7 ms), so the GPU only beats the CPU from roughly 100K keys.
+
+On the CPU baselines: for plain `u32` keys a stable sort can't give a different result,
+because equal keys are indistinguishable. `sort_unstable` (pattern-defeating quicksort) is
+the faster of the two, so it is the main baseline; the stable `sort` (driftsort) is shown
+for reference. The GPU radix sort is itself stable, which will matter once it sorts
+key/value pairs.
 
 Caveats on the wgpu_sort comparison:
 

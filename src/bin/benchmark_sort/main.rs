@@ -1,4 +1,5 @@
-// Benchmark comparing CubeCL radix sort (decoupled fallback) vs wgpu_sort.
+// Benchmark comparing CubeCL radix sort (decoupled fallback) vs wgpu_sort and CPU std sorts
+// (sort_unstable and the stable sort), all on the same inputs in one run.
 //
 // Methodology (identical for both sorters):
 // - Same random u32 input for both, regenerated per size.
@@ -8,6 +9,7 @@
 // - Report best and median over RUNS timed runs (after WARMUP untimed runs).
 // - After timing, both results are downloaded and checked against std's sort and
 //   against each other.
+// - CPU sorts: each run sorts a fresh copy of the input (copy untimed).
 //
 // Caveat: wgpu_sort always sorts key/value pairs (it has no keys-only mode), so it
 // also moves a 4-byte payload per key in each scatter pass; CubeCL sorts keys only.
@@ -193,6 +195,22 @@ fn bench_cubecl<R: Runtime>(client: &ComputeClient<R::Server>, data: &[u32]) -> 
     (Timing::from_samples(samples), sorted)
 }
 
+/// Times a CPU std sort. The copy of the input is made before the timer starts.
+fn bench_cpu(data: &[u32], sort: fn(&mut [u32])) -> Timing {
+    let samples = (0..WARMUP + RUNS)
+        .map(|_| {
+            let mut v = data.to_vec();
+            let start = Instant::now();
+            sort(&mut v);
+            let elapsed = start.elapsed();
+            std::hint::black_box(&v);
+            elapsed
+        })
+        .skip(WARMUP)
+        .collect();
+    Timing::from_samples(samples)
+}
+
 /// Wall-clock time of a sync with no work queued (CubeCL runtime overhead floor).
 fn cubecl_round_trip<R: Runtime>(client: &ComputeClient<R::Server>) -> Timing {
     let samples = (0..WARMUP + RUNS)
@@ -212,7 +230,7 @@ fn ms(d: Duration) -> f64 {
 
 #[pollster::main]
 async fn main() {
-    println!("=== Radix Sort Benchmark: CubeCL (keys) vs wgpu_sort (key/value) ===\n");
+    println!("=== Radix Sort Benchmark: CubeCL (keys) vs wgpu_sort (key/value) vs CPU std sort ===\n");
 
     let wgpu_ctx = WgpuSortContext::new().await;
 
@@ -221,8 +239,8 @@ async fn main() {
     let cubecl_client = R::client(&device);
 
     let sizes = [
-        10_000, 50_000, 100_000, 500_000, 1_000_000, 2_000_000, 5_000_000, 10_000_000,
-        16_000_000,
+        10_000, 100_000, 1_000_000, 2_000_000, 4_000_000, 5_000_000, 10_000_000, 16_000_000,
+        33_554_432,
     ];
 
     let wgpu_rt = wgpu_ctx.round_trip();
@@ -239,10 +257,16 @@ async fn main() {
         RUNS, WARMUP
     );
     println!(
-        "{:>10}  {:>19}  {:>19}  {:>14}  {}",
-        "Size", "wgpu_sort", "CubeCL", "Speedup(best)", "Check"
+        "{:>10}  {:>19}  {:>19}  {:>19}  {:>19}  {:>13}  {}",
+        "Size",
+        "CPU sort_unstable",
+        "CPU sort (stable)",
+        "wgpu_sort",
+        "CubeCL",
+        "vs wgpu_sort",
+        "Check"
     );
-    println!("{}", "-".repeat(78));
+    println!("{}", "-".repeat(124));
 
     let mut all_ok = true;
     for (i, &size) in sizes.iter().enumerate() {
@@ -250,6 +274,8 @@ async fn main() {
         let mut expected = data.clone();
         expected.sort_unstable();
 
+        let unstable_t = bench_cpu(&data, <[u32]>::sort_unstable);
+        let stable_t = bench_cpu(&data, <[u32]>::sort);
         let (wgpu_t, wgpu_out) = wgpu_ctx.bench(&data);
         let (cube_t, cube_out) = bench_cubecl::<R>(&cubecl_client, &data);
 
@@ -263,8 +289,12 @@ async fn main() {
         };
 
         println!(
-            "{:>10}  {:>8.3} / {:>8.3}  {:>8.3} / {:>8.3}  {:>13.2}x  {}",
+            "{:>10}  {:>8.3} / {:>8.3}  {:>8.3} / {:>8.3}  {:>8.3} / {:>8.3}  {:>8.3} / {:>8.3}  {:>12.2}x  {}",
             size,
+            ms(unstable_t.best),
+            ms(unstable_t.median),
+            ms(stable_t.best),
+            ms(stable_t.median),
             ms(wgpu_t.best),
             ms(wgpu_t.median),
             ms(cube_t.best),
@@ -274,7 +304,7 @@ async fn main() {
         );
     }
 
-    println!("\nSpeedup > 1.0 means CubeCL is faster.");
+    println!("\n\"vs wgpu_sort\" is the best-time speedup; > 1.0 means CubeCL is faster.");
     println!("Note: wgpu_sort also moves a payload per key (key/value sort).");
     if !all_ok {
         println!("SOME RESULTS DID NOT MATCH std sort");

@@ -36,7 +36,7 @@ The radix sort ([07_radix_sort](src/bin/07_radix_sort/)) comes with two benchmar
 | Command | Compares |
 |---------|----------|
 | `cargo bench --bench sort` | CubeCL GPU radix sort vs Rust's `sort_unstable` on the CPU |
-| `cargo run --release --bin benchmark_sort` | CubeCL radix sort vs [wgpu_sort](https://github.com/KeKsBoTer/wgpu_sort), with results cross-checked |
+| `cargo run --release --bin benchmark_sort` | CubeCL radix sort vs [wgpu_sort](https://github.com/KeKsBoTer/wgpu_sort) and CPU `sort_unstable` / stable `sort`, same inputs in one run, with results cross-checked |
 
 Both check the GPU output against `std` sort. See the
 [radix sort README](src/bin/07_radix_sort/README.md#benchmarks) for methodology and results.
