@@ -1,55 +1,114 @@
 # GPU Radix Sort in CubeCL
 
-A GPU-accelerated radix sort implementation using CubeCL, based on the algorithm from wgpu_sort and Google's Fuchsia project.
+A GPU radix sort for `u32` keys written in CubeCL. It is based on the
+"onesweep"-style algorithm from [wgpu_sort](https://github.com/KeKsBoTer/wgpu_sort) and
+Google's Fuchsia radix sort. The inter-workgroup prefix uses **Decoupled Fallback**, so the
+sort runs correctly on GPUs that don't guarantee forward progress between workgroups, such
+as Apple Silicon and ARM Mali.
+
+## Files
+
+| File | Contents |
+|------|----------|
+| [`radix_sort.rs`](radix_sort.rs) | The algorithm: kernels and host API. Shared with the benchmarks. |
+| [`main.rs`](main.rs) | Stress-test harness that compares results with `std` sort. |
+
+The benchmarks ([`benches/sort.rs`](../../../benches/sort.rs) and
+[`benchmark_sort`](../benchmark_sort/main.rs)) include `radix_sort.rs` with
+`#[path = ...] mod radix_sort;`.
+
+## Concepts Demonstrated
+
+- Plane (subgroup) operations: `plane_ballot` to rank keys that share a digit,
+  `plane_shuffle` to broadcast a value from one lane, and `plane_exclusive_sum` /
+  `plane_sum` for cube-wide scans
+- Shared-memory atomics (`SharedMemory<Atomic<u32>>`) for tile histograms
+- Global atomics (`Atomic::add`, `Atomic::max`, `Atomic::load`) for communication
+  between workgroups
+- Cube-uniform control flow: loops with `sync_cube()` inside, whose exit condition
+  comes from shared memory read after a barrier
+- `#[comptime]` kernel parameters to specialise a kernel (spin limit, test mode)
+- `launch_unchecked` kernels and ping-pong buffers across passes
 
 ## Algorithm
 
-The inter-workgroup prefix uses **Decoupled Fallback**, a portable variant of
-decoupled look-back:
+Keys are sorted 8 bits at a time, least significant digit first, so 4 passes cover 32-bit
+keys. Each pass is stable, which makes the whole LSD sort correct.
 
-- Merrill, D., & Garland, M. (2016). *Single-pass Parallel Prefix Scan with Decoupled Look-back*.
-- Smith, T., Levien, R., & Owens, J. D. (2025). *Decoupled Fallback: A Portable Single-Pass GPU Scan*. SPAA '25.
+### Kernels
 
-The algorithm performs 4 passes (8 bits per pass for 32-bit keys):
+Each sort launches 7 kernels:
 
-1. **Histogram**: Count occurrences of each digit (0-255) for all 4 passes at once
-   (this kernel also zeroes the per-pass partition status regions)
-2. **Prefix Sum**: Exclusive prefix sum of each pass's global histogram
-3. **Scatter** (per pass, one workgroup per tile of 3840 keys):
-   - Rank each key within its plane (ballot) and within its tile (shared-memory histogram)
-   - Publish the tile's per-digit reduction (`READY`), then look back over predecessor
-     tiles until a `PREFIX` is found. If a predecessor is still `NOT_READY` after
-     `max_spins` polls, the whole workgroup recomputes that tile's reduction from the
-     input keys and inserts it with `atomicMax` (**fallback**), so no workgroup ever
-     waits on one that has not been scheduled.
-   - Publish the tile's inclusive prefix (`PREFIX`), reorder the tile in shared memory,
-     and scatter to the output
+1. **`kernel_clear`**: zeroes the global histograms and the stats counters.
+2. **`kernel_calc_histogram`**: one workgroup per tile. Counts the digits of all 4 passes
+   in one read of the keys, accumulated in shared memory and then flushed to global memory
+   with atomics. It also zeroes the partition status words for all passes.
+3. **`kernel_prefix_histogram`**: a single workgroup turns each pass's histogram into an
+   exclusive prefix sum. The result is where each digit's bucket starts in the output.
+4. **`kernel_scatter`** × 4 (one launch per pass): one workgroup per tile of
+   256 threads × 15 keys = 3840 keys.
+   1. Load the tile. Each plane reads a contiguous chunk, with lanes strided by `PLANE_DIM`.
+   2. Rank each key among the lanes of its plane with the same digit. Eight `plane_ballot`
+      calls (one per digit bit) build a "same digit" lane mask.
+   3. Build the tile histogram and each key's rank within the tile. Planes take turns in
+      order, separated by barriers, so ranks follow input order and the pass is stable.
+   4. **Decoupled fallback** (described below): find, for every digit, how many keys with
+      that digit are in earlier tiles.
+   5. Exclusive scan of the tile histogram gives each digit's start within the tile.
+   6. Reorder the tile in shared memory so that the global writes are mostly contiguous.
+   7. Write each key to bucket start + count from earlier tiles + rank within tile.
 
-Partition status words are `status (2 bits) | count (30 bits)` with the monotonic
-encoding `NOT_READY (0) < READY (1) < PREFIX (2)`, so all publications are `atomicMax`
-and can never move a tile backwards. Each pass has its own status region.
+### Decoupled Fallback
 
-## Testing
+Each tile needs, for every digit, the number of keys with that digit in all earlier tiles.
+Tiles publish per-digit status words in a global buffer:
 
-```bash
-# Default config: random + adversarial inputs, compared against std's sort
-cargo run --release --bin 07_radix_sort -- 20
-# Withhold tile reductions and use 0 spins: nearly every look-back step falls back
-cargo run --release --bin 07_radix_sort -- --force-fallback 20 3841 65550 1000000
-# Custom spin limit / sizes
-cargo run --release --bin 07_radix_sort -- --spins 16 10 4000000 16000000
+```
+status word = status (2 bits) | count (30 bits)
+
+NOT_READY (0)  nothing published yet
+READY     (1)  count = this tile's own per-digit total (its reduction)
+PREFIX    (2)  count = total over this tile and all earlier tiles (inclusive prefix)
 ```
 
-Each line reports the best time and the GPU-side fallback / look-back step counters.
+A tile publishes `READY` with its own totals, then looks back through its predecessors.
+Each `READY` count is added and the look-back continues to the next earlier tile. The
+look-back stops at the first `PREFIX`, or at tile 0. Finally the tile publishes its own
+`PREFIX`.
 
-## Limitations
+Plain **decoupled look-back** spins while a predecessor is `NOT_READY`. If that
+predecessor's workgroup hasn't been scheduled, and the hardware has no forward-progress
+guarantee, the spinning workgroup can wait forever. **Decoupled fallback** bounds the
+wait:
 
-- Keys-only sorting (no key-value pairs yet)
-- Up to 2^30 - 1 keys (30-bit counts in the partition status words)
-- Requires a plane (subgroup) size between 8 and 32
-- Tested with the wgpu backend (Metal)
+- After `max_spins` polls (default 4) of a `NOT_READY` predecessor, the whole workgroup
+  reads that tile's keys from the pass input and computes its digit totals itself.
+- It publishes that result as `READY` with `atomicMax` and continues the look-back.
+  Other workgroups waiting on the same tile can then use it.
 
-## Usage
+Because every workgroup can always make progress by itself, the sort finishes however the
+GPU schedules workgroups.
+
+Implementation details:
+
+- **Only moves forward:** the encoding is ordered `NOT_READY < READY < PREFIX`, and every
+  publication uses `atomicMax`. A fallback `READY` can never overwrite a `PREFIX`.
+  Duplicate `READY` publications are identical, because a tile's totals are deterministic.
+- **One region per pass:** each pass uses its own region of the status buffer, so no
+  clearing is needed between passes.
+- **Lockstep look-back:** thread `t` handles digit `t`, but all 256 threads step through
+  predecessors together, so the whole workgroup can work on a fallback. Three rotating
+  shared-memory counter slots keep each look-back iteration to one barrier.
+- **Bucket starts kept separate:** counts in status words are relative to the start of
+  each digit's bucket. The global bucket start from `kernel_prefix_histogram` is added at
+  the end, so tile 0's `READY` count is also its `PREFIX` count.
+
+### Padding
+
+The input is padded with `0xFFFFFFFF` up to a whole number of tiles. The padding keys sort
+to the end, and the output is truncated back to the input length.
+
+## API
 
 ```rust
 use cubecl::wgpu::WgpuRuntime;
@@ -57,6 +116,96 @@ use cubecl::wgpu::WgpuRuntime;
 let device = Default::default();
 let client = WgpuRuntime::client(&device);
 
+// One-shot: upload, sort, download
 let input: Vec<u32> = (1..=1_000_000).rev().collect();
 let sorted = radix_sort_u32::<WgpuRuntime>(&client, &input);
+
+// With GPU-side counters (fallbacks, look-back steps)
+let (sorted, stats) =
+    radix_sort_u32_with_stats::<WgpuRuntime>(&client, &input, SortConfig::default());
+
+// GPU-only: reusable buffers, keys stay on the GPU
+let mut buffers = create_sort_buffers::<WgpuRuntime>(&client, input.len());
+upload_keys::<WgpuRuntime>(&client, &mut buffers, &input);
+radix_sort_u32_gpu::<WgpuRuntime>(&client, &buffers, SortConfig::default());
+// The result is in buffers.keys_a (first `input.len()` keys); this call does not sync.
 ```
+
+| Item | Purpose |
+|------|---------|
+| `SortConfig::max_spins` | Polls of a `NOT_READY` predecessor before falling back (default 4) |
+| `SortConfig::post_reduction` | Test-only. `false` stops tiles publishing `READY`, which forces fallbacks. |
+| `SortStats` | `fallbacks` and `lookback_steps`, summed over all passes |
+
+Fixed parameters at the top of `radix_sort.rs`: 8 bits per pass, 256 threads per
+workgroup, 15 keys per thread, so 3840 keys per tile.
+
+## Testing
+
+```bash
+# Default config: random + adversarial inputs, compared with std's sort
+cargo run --release --bin 07_radix_sort -- 20
+# Withhold tile reductions and use 0 spins: nearly every look-back step falls back
+cargo run --release --bin 07_radix_sort -- --force-fallback 20 3841 65550 1000000
+# Custom spin limit / sizes
+cargo run --release --bin 07_radix_sort -- --spins 16 10 4000000 16000000
+```
+
+Usage: `07_radix_sort [--force-fallback] [--spins N] [ITERS] [SIZES...]`. Inputs cycle
+through random keys, keys with many duplicates, reverse-sorted keys, all keys equal to the
+padding value, and near-maximum keys. Each output is compared exactly with `sort_unstable`.
+Each size prints the best time and the GPU-side fallback and look-back counters.
+
+## Benchmarks
+
+```bash
+cargo bench --bench sort                    # vs CPU sort_unstable
+cargo run --release --bin benchmark_sort    # vs wgpu_sort
+```
+
+Both benchmarks upload the input before each timed run, without timing it. A timed run is
+one full sort plus waiting for the GPU to finish, and each benchmark checks its results
+against `std` sort. `benchmark_sort` gives both sorters the same input, reports best and
+median over 15 runs, and checks that the two outputs agree.
+
+Results on an Apple M5 Max (wgpu / Metal):
+
+| Keys | CubeCL (best) | CPU `sort_unstable` | wgpu_sort (best) |
+|-----:|--------------:|--------------------:|-----------------:|
+| 1M   | 0.95 ms | 7.8 ms | 6.4 ms |
+| 5M   | 1.63 ms | — | 10.2 ms |
+| 10M  | 2.44 ms | — | 17.7 ms |
+| 16M  | 3.13 ms | 145 ms | 29.1 ms |
+
+The CPU and wgpu_sort columns come from different benchmark runs.
+
+Caveats on the wgpu_sort comparison:
+
+- wgpu_sort always sorts key/value pairs, so it also moves a 4-byte payload per key.
+- wgpu_sort uses wgpu 0.20. On Metal, its submit-and-wait round trip is about 1.3 ms, and
+  its timings land on multiples of that, so small sizes mostly measure that overhead.
+  `benchmark_sort` prints each runtime's empty round trip for reference.
+
+## Limitations
+
+- Keys-only sorting (no key-value pairs yet)
+- Up to 2^30 - 1 keys (30-bit counts in the partition status words)
+- Requires a plane (subgroup) size between 8 and 32. This is checked when buffers are
+  created.
+- Tested with the wgpu backend (Metal)
+
+## Gotchas
+
+- On the host, CubeCL's `PLANE_DIM` is a placeholder constant (`2`), not the hardware
+  plane size. Compute plane-dependent values such as `CUBE_DIM / PLANE_DIM` inside the
+  kernel, or read `client.properties().hardware.plane_size_*` on the host.
+- `sync_cube()` must be reached by every unit of the cube. Loops containing barriers must
+  exit on cube-uniform values, for example a shared-memory value read after a barrier.
+
+## References
+
+- Merrill, D., & Garland, M. (2016). *Single-pass Parallel Prefix Scan with Decoupled Look-back*. NVIDIA Technical Report NVR-2016-002.
+- Smith, T., Levien, R., & Owens, J. D. (2025). *Decoupled Fallback: A Portable Single-Pass GPU Scan*. SPAA '25. [doi:10.1145/3694906.3743326](https://doi.org/10.1145/3694906.3743326)
+- Adinets, A., & Merrill, D. (2022). *Onesweep: A Faster Least Significant Digit Radix Sort for GPUs*. arXiv:2206.01784.
+- [wgpu_sort](https://github.com/KeKsBoTer/wgpu_sort), the WebGPU implementation this port is based on
+- [Fuchsia radix sort](https://fuchsia.googlesource.com/fuchsia/+/refs/heads/main/src/graphics/lib/compute/radix_sort/)
